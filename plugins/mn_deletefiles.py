@@ -3,6 +3,7 @@ import asyncio
 import re
 
 from pyrogram import Client, filters, enums
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
 from database.ia_filterdb import Media, USE_MONGO
@@ -169,6 +170,7 @@ async def close_message(bot: Client, query: CallbackQuery):
 # ─── duplicate cleanup ───────────────────────────────────────────────────────
 DUP_SCAN_CACHE = {}
 DUP_BATCH_DELETE = 500
+DUP_PROGRESS_EVERY = 30
 LANG_ALIASES = {
     "malayalam": "mal", "mal": "mal", "ml": "mal",
     "tamil": "tam", "tam": "tam", "ta": "tam",
@@ -256,6 +258,19 @@ def _pick_keeper(docs):
     return max(docs, key=lambda d: (int(d.get('file_size') or 0), float(d.get('created_at') or 0)))
 
 
+async def _safe_edit_duplicate_status(message, text, **kwargs):
+    while True:
+        try:
+            return await message.edit_text(text, **kwargs)
+        except FloodWait as fw:
+            wait_time = getattr(fw, 'value', 0) + 1
+            logger.warning("FloodWait while updating duplicate cleanup status; sleeping %ss", wait_time)
+            await asyncio.sleep(wait_time)
+        except Exception:
+            logger.exception("Failed to update duplicate cleanup status")
+            return None
+
+
 def _delete_op_for_doc(doc):
     if USE_MONGO and doc.get('_col') is not None:
         return ('shard', int(doc['_col']), doc['_id'])
@@ -304,11 +319,12 @@ async def _scan_duplicate_ops(status=None):
     async def _progress(force=False):
         nonlocal last_edit
         now = asyncio.get_running_loop().time()
-        if not status or (not force and now - last_edit < 5):
+        if not status or (not force and now - last_edit < DUP_PROGRESS_EVERY):
             return
         last_edit = now
         try:
-            await status.edit_text(
+            await _safe_edit_duplicate_status(
+                status,
                 "🔍 Scanning DB for duplicate files...\n\n"
                 f"Checked: <code>{checked}</code>\n"
                 f"Duplicate groups: <code>{duplicate_sets}</code>\n"
@@ -380,10 +396,11 @@ async def delete_duplicate_files(bot: Client, message: Message):
     checked, duplicate_ops, duplicate_sets = await _scan_duplicate_ops(status)
 
     if not duplicate_ops:
-        return await status.edit_text(f"✅ Scan complete. Checked <code>{checked}</code> files. No duplicates found.")
+        return await _safe_edit_duplicate_status(status, f"✅ Scan complete. Checked <code>{checked}</code> files. No duplicates found.")
 
     DUP_SCAN_CACHE[message.from_user.id] = duplicate_ops
-    await status.edit_text(
+    await _safe_edit_duplicate_status(
+        status,
         "⚠️ Duplicate scan complete.\n\n"
         f"Checked files: <code>{checked}</code>\n"
         f"Duplicate groups: <code>{duplicate_sets}</code>\n"
@@ -406,9 +423,9 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
     ids = DUP_SCAN_CACHE.pop(owner, [])
     if action == "no":
         await query.answer("Cancelled")
-        return await query.message.edit_text("❌ Duplicate deletion cancelled.")
+        return await _safe_edit_duplicate_status(query.message, "❌ Duplicate deletion cancelled.")
     if not ids:
-        return await query.message.edit_text("No cached duplicate scan found. Run /deleteduplicates again.")
+        return await _safe_edit_duplicate_status(query.message, "No cached duplicate scan found. Run /deleteduplicates again.")
 
     await query.answer("Deleting duplicates...")
     deleted = 0
@@ -416,14 +433,25 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
     id_ops = [op[1] for op in ids if op[0] == 'id']
     shard_ops = [op for op in ids if op[0] == 'shard']
 
+    last_delete_edit = 0
+
+    async def _delete_progress(force=False):
+        nonlocal last_delete_edit
+        now = asyncio.get_running_loop().time()
+        if not force and now - last_delete_edit < DUP_PROGRESS_EVERY:
+            return
+        last_delete_edit = now
+        await _safe_edit_duplicate_status(
+            query.message,
+            f"🗑️ Deleted <code>{deleted}</code>/<code>{total}</code> duplicate files...",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
     for start in range(0, len(id_ops), DUP_BATCH_DELETE):
         batch = id_ops[start:start + DUP_BATCH_DELETE]
         result = await Media.collection.delete_many({'_id': {'$in': batch}})
         deleted += result.deleted_count
-        await query.message.edit_text(
-            f"🗑️ Deleted <code>{deleted}</code>/<code>{total}</code> duplicate files...",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        await _delete_progress()
         await asyncio.sleep(0.1)
 
     if shard_ops and USE_MONGO:
@@ -431,13 +459,11 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
         for _, col_idx, file_id in shard_ops:
             result = await media_db._mongo_collections[col_idx].delete_one({'_id': file_id})
             deleted += result.deleted_count
-            if deleted % DUP_BATCH_DELETE == 0:
-                await query.message.edit_text(
-                    f"🗑️ Deleted <code>{deleted}</code>/<code>{total}</code> duplicate files...",
-                    parse_mode=enums.ParseMode.HTML,
-                )
-                await asyncio.sleep(0.1)
-    await query.message.edit_text(
+            await _delete_progress()
+            await asyncio.sleep(0)
+
+    await _safe_edit_duplicate_status(
+        query.message,
         f"✅ Duplicate cleanup finished. Deleted <code>{deleted}</code> files.",
         parse_mode=enums.ParseMode.HTML,
     )
