@@ -16,7 +16,7 @@ from sqlalchemy import text
 from info import (
     DATABASE_URI, DATABASE_NAME, COLLECTION_NAME, USE_CAPTION_FILTER,
     DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5,
-    DATABASE_NAME2, DATABASE_NAME3, DATABASE_NAME4, DATABASE_NAME5, INDEX_MODE,
+    DATABASE_NAME2, DATABASE_NAME3, DATABASE_NAME4, DATABASE_NAME5, INDEX_MODE, MEDIA_CACHE_MAX,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ VALID_INDEX_MODES = {'both', 'series', 'movies'}
 _ACTIVE_INDEX_MODE = INDEX_MODE if INDEX_MODE in VALID_INDEX_MODES else 'both'
 _MEDIA_CACHE = OrderedDict()
 _MEDIA_CACHE_READY = False
+_MEDIA_CACHE_COMPLETE = False
 _MEDIA_CACHE_LOCK = asyncio.Lock()
 
 
@@ -77,12 +78,17 @@ def media_allowed_for_index(file_name, mode=None):
 
 
 def _cache_doc(doc):
-    if not doc:
+    global _MEDIA_CACHE_COMPLETE
+    if not doc or MEDIA_CACHE_MAX <= 0:
         return
     d = _as_media_doc(doc)
     fid = d.get('_id') or d.get('file_id')
     if fid:
         _MEDIA_CACHE[fid] = d
+        _MEDIA_CACHE.move_to_end(fid)
+        while len(_MEDIA_CACHE) > MEDIA_CACHE_MAX:
+            _MEDIA_CACHE.popitem(last=False)
+            _MEDIA_CACHE_COMPLETE = False
 
 
 def _uncache_doc(file_id):
@@ -264,9 +270,11 @@ class SQLMediaCollection:
         return SQLDeleteResult(1)
 
     async def drop(self):
+        global _MEDIA_CACHE_COMPLETE
         with store.begin() as conn:
             conn.execute(text("DELETE FROM media"))
         _MEDIA_CACHE.clear()
+        _MEDIA_CACHE_COMPLETE = True
         _SEARCH_CACHE.clear()
 
 
@@ -386,8 +394,10 @@ if USE_MONGO:
             return SQLDeleteResult(deleted)
 
         async def drop(self):
+            global _MEDIA_CACHE_COMPLETE
             await asyncio.gather(*[col.drop() for col in _mongo_collections])
             _MEDIA_CACHE.clear()
+            _MEDIA_CACHE_COMPLETE = True
             _SEARCH_CACHE.clear()
 
     class Media:
@@ -416,7 +426,7 @@ if USE_MONGO:
         @staticmethod
         async def count_documents(query=None):
             q = query or {}
-            if _MEDIA_CACHE_READY:
+            if _MEDIA_CACHE_COMPLETE:
                 return sum(1 for doc in _MEDIA_CACHE.values() if _match_filter(doc, q))
             if MONGO_SHARD_COUNT == 1:
                 return await _mongo_collections[0].count_documents(q)
@@ -459,39 +469,78 @@ else:
 
 
 async def preload_media_cache(force=False):
-    """Load all indexed media into process memory after deploy/restart."""
-    global _MEDIA_CACHE_READY
+    """Warm a bounded media cache after deploy/restart without exhausting RAM."""
+    global _MEDIA_CACHE_READY, _MEDIA_CACHE_COMPLETE
     if _MEDIA_CACHE_READY and not force:
         return len(_MEDIA_CACHE)
     async with _MEDIA_CACHE_LOCK:
         if _MEDIA_CACHE_READY and not force:
             return len(_MEDIA_CACHE)
+
+        _MEDIA_CACHE.clear()
+        _MEDIA_CACHE_COMPLETE = False
+        cache_limit = max(int(MEDIA_CACHE_MAX or 0), 0)
+        if cache_limit <= 0:
+            _MEDIA_CACHE_READY = True
+            _SEARCH_CACHE.clear()
+            logger.info('Media runtime cache preload disabled (MEDIA_CACHE_MAX=%s)', MEDIA_CACHE_MAX)
+            return 0
+
         docs = OrderedDict()
+        loaded = 0
+        truncated = False
         if USE_MONGO:
             projection = {
                 'file_ref': 1, 'file_name': 1, 'file_size': 1, 'file_type': 1,
                 'mime_type': 1, 'caption': 1, 'created_at': 1,
             }
+            per_shard_limit = max(1, (cache_limit // max(MONGO_SHARD_COUNT, 1)) + 1)
+
             async def _load(col):
-                return await col.find({}, projection).sort('created_at', -1).to_list(length=None)
+                return await (
+                    col.find({}, projection)
+                    .sort('created_at', -1)
+                    .limit(per_shard_limit)
+                    .to_list(length=per_shard_limit)
+                )
+
             parts = await asyncio.gather(*[_load(col) for col in _mongo_collections])
             for part in parts:
+                loaded += len(part)
+                if len(part) >= per_shard_limit:
+                    truncated = True
                 for doc in part:
                     d = _as_media_doc(doc)
                     fid = d.get('_id') or d.get('file_id')
                     if fid:
                         docs[fid] = d
         else:
-            for doc in _load_docs_sync({}):
-                d = _as_media_doc(doc)
-                fid = d.get('_id') or d.get('file_id')
-                if fid:
-                    docs[fid] = d
-        _MEDIA_CACHE.clear()
-        _MEDIA_CACHE.update(docs)
+            with store.begin() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at "
+                        "FROM media ORDER BY created_at DESC LIMIT :limit"
+                    ),
+                    {"limit": cache_limit + 1},
+                ).fetchall()
+            loaded = len(rows)
+            truncated = loaded > cache_limit
+            for row in rows[:cache_limit]:
+                d = _sql_row_to_doc(row)
+                docs[d.get('file_id')] = d
+
+        for fid, doc in sorted(docs.items(), key=lambda item: item[1].get('created_at', 0)):
+            _MEDIA_CACHE[fid] = doc
+            while len(_MEDIA_CACHE) > cache_limit:
+                _MEDIA_CACHE.popitem(last=False)
+
         _MEDIA_CACHE_READY = True
+        _MEDIA_CACHE_COMPLETE = not truncated and loaded <= cache_limit
         _SEARCH_CACHE.clear()
-        logger.info('Preloaded %d media records into local runtime cache', len(_MEDIA_CACHE))
+        logger.info(
+            'Preloaded %d recent media records into runtime cache (complete=%s, max=%d)',
+            len(_MEDIA_CACHE), _MEDIA_CACHE_COMPLETE, cache_limit,
+        )
         return len(_MEDIA_CACHE)
 
 
@@ -734,7 +783,7 @@ async def get_search_results(
         'created_at': 1,
     }
 
-    if _MEDIA_CACHE_READY:
+    if _MEDIA_CACHE_COMPLETE:
         matched = [d for d in _MEDIA_CACHE.values() if _match_filter(d, search_filter)]
         matched.sort(key=lambda d: d.get('created_at', 0), reverse=True)
         page = matched[offset: offset + max_results + (1 if fast else 0)]

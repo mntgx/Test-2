@@ -84,6 +84,7 @@ FILE_AUTO_DELETE_SECONDS = int(environ.get('FILE_AUTO_DELETE_SECONDS', 60))  # D
 
 # Indexing / request routing
 INDEX_MODE = environ.get('INDEX_MODE', 'both').strip().lower()
+MEDIA_CACHE_MAX = int(environ.get('MEDIA_CACHE_MAX', 5000))
 MOVIES_REQUEST_GROUP = environ.get('MOVIES_REQUEST_GROUP', '@malayalam_2022')
 SERIES_REQUEST_GROUP = environ.get('SERIES_REQUEST_GROUP', '@seriesgroup')
 
