@@ -10,7 +10,7 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
 from database.ia_filterdb import Media, USE_MONGO, duplicate_key_for_doc, duplicate_sizes_match
-from info import ADMINS
+from info import ADMINS, DUP_SCAN_CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,8 @@ def _delete_op_for_doc(doc):
 
 
 def _scan_db_path():
-    fd, path = tempfile.mkstemp(prefix="dup_scan_", suffix=".sqlite3")
+    os.makedirs(DUP_SCAN_CACHE_DIR, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="dup_scan_", suffix=".sqlite3", dir=DUP_SCAN_CACHE_DIR)
     os.close(fd)
     return path
 

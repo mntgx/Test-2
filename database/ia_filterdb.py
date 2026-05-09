@@ -19,7 +19,7 @@ from info import (
     DATABASE_URI, DATABASE_NAME, COLLECTION_NAME, USE_CAPTION_FILTER,
     DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5,
     DATABASE_NAME2, DATABASE_NAME3, DATABASE_NAME4, DATABASE_NAME5, INDEX_MODE, MEDIA_CACHE_MAX,
-    DISK_MEDIA_CACHE, DISK_MEDIA_CACHE_PATH, ADVANCED_DUPLICATE_SKIP,
+    DISK_MEDIA_CACHE, DISK_MEDIA_CACHE_PATH, DISK_MEDIA_CACHE_MAX_BYTES, ADVANCED_DUPLICATE_SKIP,
 )
 
 logger = logging.getLogger(__name__)
@@ -222,6 +222,49 @@ def _disk_cache_path():
     return str(DISK_MEDIA_CACHE_PATH)
 
 
+def _disk_cache_files_size():
+    path = _disk_cache_path()
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += os.path.getsize(path + suffix)
+        except OSError:
+            pass
+    return total
+
+
+def _disk_cache_limit_reached():
+    return bool(DISK_MEDIA_CACHE_MAX_BYTES and _disk_cache_files_size() >= int(DISK_MEDIA_CACHE_MAX_BYTES))
+
+
+def _disk_cache_near_limit():
+    return bool(DISK_MEDIA_CACHE_MAX_BYTES and _disk_cache_files_size() >= int(DISK_MEDIA_CACHE_MAX_BYTES) * 0.9)
+
+
+def _disk_trim_conn(conn):
+    if not DISK_MEDIA_CACHE_MAX_BYTES:
+        return 0
+    max_bytes = int(DISK_MEDIA_CACHE_MAX_BYTES)
+    removed = 0
+    conn.commit()
+    while _disk_cache_files_size() > max_bytes:
+        rows = conn.execute("SELECT file_id FROM media ORDER BY created_at ASC LIMIT 5000").fetchall()
+        if not rows:
+            break
+        conn.executemany("DELETE FROM media WHERE file_id=?", [(row[0],) for row in rows])
+        removed += len(rows)
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if removed >= 50000:
+            break
+    if removed:
+        try:
+            conn.execute("VACUUM")
+        except sqlite3.OperationalError:
+            logger.warning("Could not vacuum disk media cache after trim", exc_info=True)
+    return removed
+
+
 def _disk_connect():
     path = _disk_cache_path()
     directory = os.path.dirname(path)
@@ -272,6 +315,9 @@ def _disk_upsert_many_sync(docs):
             "VALUES (?,?,?,?,?,?,?,?)",
             rows,
         )
+        trimmed = _disk_trim_conn(conn)
+        if trimmed:
+            logger.info("Trimmed %d old rows from disk media cache to stay under %s bytes", trimmed, DISK_MEDIA_CACHE_MAX_BYTES)
     return len(rows)
 
 
@@ -779,7 +825,10 @@ async def preload_media_cache(force=False):
             total = 0
             batch = []
             recent_docs = []
+            disk_full = False
             for col in _mongo_collections:
+                if disk_full:
+                    break
                 cursor = col.find({}, projection).sort('created_at', -1).batch_size(500)
                 async for doc in cursor:
                     if cache_limit > 0 and len(recent_docs) < cache_limit:
@@ -788,9 +837,14 @@ async def preload_media_cache(force=False):
                     if len(batch) >= 1000:
                         total += await asyncio.to_thread(_disk_upsert_many_sync, batch)
                         batch = []
+                        if await asyncio.to_thread(_disk_cache_near_limit):
+                            disk_full = True
+                            break
                 if batch:
                     total += await asyncio.to_thread(_disk_upsert_many_sync, batch)
                     batch = []
+                if await asyncio.to_thread(_disk_cache_near_limit):
+                    disk_full = True
             for doc in sorted(recent_docs, key=lambda d: d.get('created_at', 0)):
                 fid = doc.get('_id') or doc.get('file_id')
                 if fid:
@@ -798,10 +852,10 @@ async def preload_media_cache(force=False):
                     while len(_MEDIA_CACHE) > cache_limit:
                         _MEDIA_CACHE.popitem(last=False)
             _DISK_CACHE_READY = True
-            _DISK_CACHE_COMPLETE = True
+            _DISK_CACHE_COMPLETE = not disk_full
             _MEDIA_CACHE_READY = True
             _SEARCH_CACHE.clear()
-            logger.info('Mirrored %d media records into disk cache at %s', total, _disk_cache_path())
+            logger.info('Mirrored %d media records into disk cache at %s (complete=%s, max_bytes=%s)', total, _disk_cache_path(), _DISK_CACHE_COMPLETE, DISK_MEDIA_CACHE_MAX_BYTES)
             return total
 
         if cache_limit <= 0:
