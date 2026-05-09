@@ -43,13 +43,17 @@ START_PAYLOAD_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 def _bot_start_url(payload=None):
     username = str(getattr(temp, 'U_NAME', '') or '').lstrip('@')
-    base = f"https://t.me/{username}" if username else "https://t.me"
+    if not username:
+        return None
+    base = f"https://t.me/{username}"
     if payload and START_PAYLOAD_RE.fullmatch(str(payload)):
         return f"{base}?start={payload}"
     return base
 
 
 async def _answer_url_or_alert(query, url, alert="Open the bot PM and try again."):
+    if not url:
+        return await query.answer(alert, show_alert=True)
     try:
         return await query.answer(url=url)
     except Exception:
@@ -430,26 +434,21 @@ async def cb_handler(client: Client, query: CallbackQuery):
         if f_caption is None:
             f_caption = f"{files.file_name}"
 
+        pm_url = _bot_start_url(f"{ident}_{file_id}")
         try:
             if not await is_subscribed(query.from_user.id, client):
                 invite_links = await create_invite_links(client)
                 first_link = next(iter(invite_links.values()), _bot_start_url())
                 await _answer_url_or_alert(query, first_link, "Join the required channel and try again.")
                 return
-            await client.send_cached_media(
-                chat_id=query.from_user.id,
-                file_id=file_id,
-                caption=f_caption,
-                protect_content=True if ident in {'filep', 'filesp'} else False,
-            )
-            await query.answer("Sent in PM ✅")
+            await _answer_url_or_alert(query, pm_url, "Open the bot PM and try again.")
         except UserIsBlocked:
             await query.answer('Unblock the bot mahn !', show_alert=True)
         except PeerIdInvalid:
-            await _answer_url_or_alert(query, _bot_start_url(), "Start the bot PM first, then try again.")
+            await _answer_url_or_alert(query, pm_url, "Start the bot PM first, then try again.")
         except Exception as e:
             logger.exception(e)
-            await _answer_url_or_alert(query, _bot_start_url(), "Open the bot PM and try again.")
+            await _answer_url_or_alert(query, pm_url, "Open the bot PM and try again.")
     elif query.data.startswith("checksub"):
         if not await is_subscribed(query.from_user.id, client):
             await query.answer("I Like Your Smartness, But Don't Be Oversmart", show_alert=True)
