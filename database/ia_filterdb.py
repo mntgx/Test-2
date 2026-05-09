@@ -7,6 +7,7 @@ import base64
 import asyncio
 import time
 import os
+import shutil
 import sqlite3
 from pyrogram.file_id import FileId
 from pymongo.errors import DuplicateKeyError, OperationFailure
@@ -233,18 +234,34 @@ def _disk_cache_files_size():
     return total
 
 
+def _disk_cache_auto_max_bytes():
+    configured = int(DISK_MEDIA_CACHE_MAX_BYTES or 0)
+    if configured > 0:
+        return configured
+    path = _disk_cache_path()
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+        usage = shutil.disk_usage(directory)
+    except OSError:
+        logger.warning("Could not read disk usage for %s; using 1500MB disk cache cap", directory, exc_info=True)
+        return 1500 * 1024**2
+    reserve = 2 * 1024**3 if usage.total >= 8 * 1024**3 else 512 * 1024**2
+    usable_free = max(256 * 1024**2, usage.free - reserve)
+    sixty_percent_total = int(usage.total * 0.60)
+    return max(256 * 1024**2, min(usable_free, sixty_percent_total, 12 * 1024**3))
+
+
 def _disk_cache_limit_reached():
-    return bool(DISK_MEDIA_CACHE_MAX_BYTES and _disk_cache_files_size() >= int(DISK_MEDIA_CACHE_MAX_BYTES))
+    return _disk_cache_files_size() >= _disk_cache_auto_max_bytes()
 
 
 def _disk_cache_near_limit():
-    return bool(DISK_MEDIA_CACHE_MAX_BYTES and _disk_cache_files_size() >= int(DISK_MEDIA_CACHE_MAX_BYTES) * 0.9)
+    return _disk_cache_files_size() >= int(_disk_cache_auto_max_bytes() * 0.9)
 
 
 def _disk_trim_conn(conn):
-    if not DISK_MEDIA_CACHE_MAX_BYTES:
-        return 0
-    max_bytes = int(DISK_MEDIA_CACHE_MAX_BYTES)
+    max_bytes = _disk_cache_auto_max_bytes()
     removed = 0
     conn.commit()
     while _disk_cache_files_size() > max_bytes:
@@ -317,7 +334,7 @@ def _disk_upsert_many_sync(docs):
         )
         trimmed = _disk_trim_conn(conn)
         if trimmed:
-            logger.info("Trimmed %d old rows from disk media cache to stay under %s bytes", trimmed, DISK_MEDIA_CACHE_MAX_BYTES)
+            logger.info("Trimmed %d old rows from disk media cache to stay under %s bytes", trimmed, _disk_cache_auto_max_bytes())
     return len(rows)
 
 
@@ -855,7 +872,7 @@ async def preload_media_cache(force=False):
             _DISK_CACHE_COMPLETE = not disk_full
             _MEDIA_CACHE_READY = True
             _SEARCH_CACHE.clear()
-            logger.info('Mirrored %d media records into disk cache at %s (complete=%s, max_bytes=%s)', total, _disk_cache_path(), _DISK_CACHE_COMPLETE, DISK_MEDIA_CACHE_MAX_BYTES)
+            logger.info('Mirrored %d media records into disk cache at %s (complete=%s, max_bytes=%s)', total, _disk_cache_path(), _DISK_CACHE_COMPLETE, _disk_cache_auto_max_bytes())
             return total
 
         if cache_limit <= 0:
