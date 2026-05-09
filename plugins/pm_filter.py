@@ -4,6 +4,7 @@ import asyncio
 import re
 import ast
 import math
+from urllib.parse import quote_plus
 from pyrogram.errors.exceptions.bad_request_400 import MediaEmpty, PhotoInvalidDimensions, WebpageMediaEmpty
 from Script import script
 import pyrogram
@@ -12,7 +13,7 @@ from database.connections_mdb import active_connection, all_connections, delete_
 from info import (
     ADMINS, AUTH_USERS, CUSTOM_FILE_CAPTION, AUTH_GROUPS, P_TTI_SHOW_OFF, IMDB,
     SINGLE_BUTTON, SPELL_CHECK_REPLY, IMDB_TEMPLATE, DATABASE_URI, DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5,
-    POSTGRES_STORAGE_LIMIT_BYTES,
+    POSTGRES_STORAGE_LIMIT_BYTES, MOVIES_REQUEST_GROUP, SERIES_REQUEST_GROUP,
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram import Client, filters, enums
@@ -20,7 +21,7 @@ from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerId
 from utils import get_size, is_subscribed, get_poster, search_gagala, temp, get_settings, save_group_settings, create_invite_links
 from database.users_chats_db import db
 from info import HYPER_MODE
-from database.ia_filterdb import Media, get_file_details, get_search_results
+from database.ia_filterdb import Media, get_file_details, get_search_results, get_index_mode, is_series_name
 from database.filters_mdb import (
     del_all,
     find_filter,
@@ -35,6 +36,40 @@ BUTTONS = {}
 MONGO_DB_CAP_BYTES = 536870912
 MONGO_DB_COUNT = len([u for u in (DATABASE_URI, DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5) if u])
 SPELL_CHECK = {}
+
+
+START_PAYLOAD_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _bot_start_url(payload=None):
+    username = str(getattr(temp, 'U_NAME', '') or '').lstrip('@')
+    base = f"https://t.me/{username}" if username else "https://t.me"
+    if payload and START_PAYLOAD_RE.fullmatch(str(payload)):
+        return f"{base}?start={payload}"
+    return base
+
+
+async def _answer_url_or_alert(query, url, alert="Open the bot PM and try again."):
+    try:
+        return await query.answer(url=url)
+    except Exception:
+        return await query.answer(alert, show_alert=True)
+
+
+def _looks_like_series_request(text: str) -> bool:
+    raw = str(text or '').lower()
+    if is_series_name(raw):
+        return True
+    return bool(re.search(r"\b(series|season|episode|episodes|web\s*series)\b", raw, re.I))
+
+
+def _index_mode_redirect_message(text: str):
+    mode = get_index_mode()
+    if mode == 'series' and not _looks_like_series_request(text):
+        return f"ask movies in {MOVIES_REQUEST_GROUP}"
+    if mode == 'movies' and _looks_like_series_request(text):
+        return f"ask series in {SERIES_REQUEST_GROUP}"
+    return None
 
 
 def _format_search_time(seconds):
@@ -84,7 +119,7 @@ async def next_page(bot, query):
     if HYPER_MODE:
         cap_lines = []
         for file in files:
-            file_link = f"https://t.me/{temp.U_NAME}?start=file_{file.file_id}"
+            file_link = _bot_start_url(f"file_{file.file_id}")
             cap_lines.append(f"📁 {get_size(file.file_size)} - [{file.file_name}]({file_link})")
         cap_text = "\n".join(cap_lines)
         cap_text = f"{cap_text}\n\n{_format_search_time(search_time)}"
@@ -398,20 +433,23 @@ async def cb_handler(client: Client, query: CallbackQuery):
         try:
             if not await is_subscribed(query.from_user.id, client):
                 invite_links = await create_invite_links(client)
-                first_link = next(iter(invite_links.values()), f"https://t.me/{temp.U_NAME}?start={ident}_{file_id}")
-                await query.answer(url=first_link)
+                first_link = next(iter(invite_links.values()), _bot_start_url())
+                await _answer_url_or_alert(query, first_link, "Join the required channel and try again.")
                 return
-            elif settings['botpm']:
-                await query.answer(url=f"https://t.me/{temp.U_NAME}?start={ident}_{file_id}")
-                return
-            else:
-                await query.answer(url=f"https://t.me/{temp.U_NAME}?start={ident}_{file_id}")
+            await client.send_cached_media(
+                chat_id=query.from_user.id,
+                file_id=file_id,
+                caption=f_caption,
+                protect_content=True if ident in {'filep', 'filesp'} else False,
+            )
+            await query.answer("Sent in PM ✅")
         except UserIsBlocked:
             await query.answer('Unblock the bot mahn !', show_alert=True)
         except PeerIdInvalid:
-            await query.answer(url=f"https://t.me/{temp.U_NAME}?start={ident}_{file_id}")
+            await _answer_url_or_alert(query, _bot_start_url(), "Start the bot PM first, then try again.")
         except Exception as e:
-            await query.answer(url=f"https://t.me/{temp.U_NAME}?start={ident}_{file_id}")
+            logger.exception(e)
+            await _answer_url_or_alert(query, _bot_start_url(), "Open the bot PM and try again.")
     elif query.data.startswith("checksub"):
         if not await is_subscribed(query.from_user.id, client):
             await query.answer("I Like Your Smartness, But Don't Be Oversmart", show_alert=True)
@@ -732,6 +770,11 @@ async def auto_filter(client, msg, spoll=False):
         if re.findall(r"((^\/|^,|^!|^\.|^[\U0001F600-\U000E007F]).*)", message.text):
             return
         if 2 < len(message.text) < 100:
+            redirect = _index_mode_redirect_message(message.text) if message.chat.type == enums.ChatType.PRIVATE else None
+            if redirect:
+                note = await message.reply_text(redirect)
+                await asyncio.sleep(20)
+                return await note.delete()
             search = message.text
             files, offset, total_results, search_time = await get_search_results(
                 search.lower(), offset=0, filter=True, fast=True, return_time=True
@@ -757,7 +800,7 @@ async def auto_filter(client, msg, spoll=False):
     if HYPER_MODE:
         cap_lines = []
         for file in files:
-            file_link = f"https://t.me/{temp.U_NAME}?start={pre}_{file.file_id}"
+            file_link = _bot_start_url(f"{pre}_{file.file_id}")
             cap_lines.append(f"📁 {get_size(file.file_size)} - [{file.file_name}]({file_link})")
         cap_text = "\n".join(cap_lines)
         cap_text = f"{cap_text}\n\n{_format_search_time(search_time)}"
@@ -903,7 +946,7 @@ async def advantage_spell_chok(client, msg):
         movies = await get_poster(mv_rqst, bulk=True)
     except Exception as e:
         logger.exception(e)
-        reqst_gle = mv_rqst.replace(" ", "+")
+        reqst_gle = quote_plus(mv_rqst)
         button = [[
                  InlineKeyboardButton('ENG', callback_data='esp'),
                  InlineKeyboardButton('MAL', callback_data='msp'),
@@ -923,7 +966,7 @@ async def advantage_spell_chok(client, msg):
         return
     movielist = []
     if not movies:
-        reqst_gle = mv_rqst.replace(" ", "+")
+        reqst_gle = quote_plus(mv_rqst)
         button = [[
                  InlineKeyboardButton('ENG', callback_data='esp'),
                  InlineKeyboardButton('MAL', callback_data='msp'),

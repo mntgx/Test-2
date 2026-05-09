@@ -79,6 +79,23 @@ def set_runtime_update_config(key: str, value):
     else:
         raise KeyError(key)
 
+
+
+async def load_runtime_update_config():
+    saved = await db.get_config_value("runtime_update_config", {})
+    if not isinstance(saved, dict):
+        return
+    for key in ("PAGE_SIZE", "SEND_DELAY", "GETDLINK_PAGE_SIZE", "GROUP_SIZE", "CHANNEL_SEND_MODE", "GROUP_SEARCH_TEXT"):
+        if key in saved:
+            try:
+                set_runtime_update_config(key, saved[key])
+            except Exception:
+                logger.warning("Ignoring invalid saved update config %s=%r", key, saved[key])
+
+
+async def persist_runtime_update_config():
+    await db.set_config_value("runtime_update_config", get_runtime_update_config())
+
 # ─── Per-admin session state for /getdlink flow ───────────────────────────────
 # Structure: { user_id: { "results": [...], "query": str, "page": int } }
 _getdlink_sessions: dict[int, dict] = {}
