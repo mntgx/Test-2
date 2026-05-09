@@ -6,6 +6,8 @@ import re
 import base64
 import asyncio
 import time
+import os
+import sqlite3
 from pyrogram.file_id import FileId
 from pymongo.errors import DuplicateKeyError, OperationFailure
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -17,6 +19,7 @@ from info import (
     DATABASE_URI, DATABASE_NAME, COLLECTION_NAME, USE_CAPTION_FILTER,
     DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5,
     DATABASE_NAME2, DATABASE_NAME3, DATABASE_NAME4, DATABASE_NAME5, INDEX_MODE, MEDIA_CACHE_MAX,
+    DISK_MEDIA_CACHE, DISK_MEDIA_CACHE_PATH,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,8 @@ _MEDIA_CACHE = OrderedDict()
 _MEDIA_CACHE_READY = False
 _MEDIA_CACHE_COMPLETE = False
 _MEDIA_CACHE_LOCK = asyncio.Lock()
+_DISK_CACHE_READY = False
+_DISK_CACHE_COMPLETE = False
 
 
 def normalize_index_mode(value):
@@ -95,6 +100,137 @@ def _uncache_doc(file_id):
     _MEDIA_CACHE.pop(file_id, None)
 
 
+
+
+def _disk_cache_enabled():
+    return bool(DISK_MEDIA_CACHE and DISK_MEDIA_CACHE_PATH)
+
+
+def _disk_cache_path():
+    return str(DISK_MEDIA_CACHE_PATH)
+
+
+def _disk_connect():
+    path = _disk_cache_path()
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _disk_init_sync(reset=False):
+    with _disk_connect() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS media ("
+            "file_id TEXT PRIMARY KEY, file_ref TEXT, file_name TEXT, "
+            "file_size INTEGER, file_type TEXT, mime_type TEXT, caption TEXT, created_at REAL)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_disk_media_created_at ON media(created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_disk_media_file_type ON media(file_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_disk_media_file_name ON media(file_name)")
+        if reset:
+            conn.execute("DELETE FROM media")
+
+
+def _disk_doc_tuple(doc):
+    d = _as_media_doc(doc)
+    return (
+        d.get('_id') or d.get('file_id'),
+        d.get('file_ref'),
+        d.get('file_name'),
+        d.get('file_size'),
+        d.get('file_type'),
+        d.get('mime_type'),
+        d.get('caption'),
+        d.get('created_at') or 0,
+    )
+
+
+def _disk_upsert_many_sync(docs):
+    rows = [row for row in (_disk_doc_tuple(doc) for doc in docs) if row[0]]
+    if not rows:
+        return 0
+    with _disk_connect() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO media(file_id,file_ref,file_name,file_size,file_type,mime_type,caption,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            rows,
+        )
+    return len(rows)
+
+
+def _disk_delete_many_sync(file_ids):
+    ids = [fid for fid in file_ids if fid]
+    if not ids:
+        return
+    with _disk_connect() as conn:
+        conn.executemany("DELETE FROM media WHERE file_id=?", [(fid,) for fid in ids])
+
+
+def _disk_clear_sync():
+    with _disk_connect() as conn:
+        conn.execute("DELETE FROM media")
+
+
+def _disk_row_to_doc(row):
+    return SQLMediaDoc(
+        dict(
+            file_id=row['file_id'],
+            _id=row['file_id'],
+            file_ref=row['file_ref'],
+            file_name=row['file_name'],
+            file_size=row['file_size'],
+            file_type=row['file_type'],
+            mime_type=row['mime_type'],
+            caption=row['caption'],
+            created_at=row['created_at'],
+        )
+    )
+
+
+def _disk_count_all_sync():
+    with _disk_connect() as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM media").fetchone()[0] or 0)
+
+
+def _disk_search_sync(query, file_type=None, max_results=10, offset=0, fast=False):
+    terms = [t for t in str(query or '').split() if t]
+    where = []
+    params = []
+    if file_type:
+        where.append("file_type = ?")
+        params.append(file_type)
+    for term in terms:
+        where.append("(file_name LIKE ? COLLATE NOCASE" + (" OR COALESCE(caption, '') LIKE ? COLLATE NOCASE" if USE_CAPTION_FILTER else "") + ")")
+        like = f"%{term}%"
+        params.append(like)
+        if USE_CAPTION_FILTER:
+            params.append(like)
+    where_clause = " AND ".join(where) if where else "1=1"
+    limit = max_results + 1 if fast else max_results
+    with _disk_connect() as conn:
+        total_results = None if fast else int(conn.execute(f"SELECT COUNT(*) FROM media WHERE {where_clause}", params).fetchone()[0] or 0)
+        rows = conn.execute(
+            f"SELECT file_id, file_ref, file_name, file_size, file_type, mime_type, caption, created_at "
+            f"FROM media WHERE {where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    files = [_disk_row_to_doc(row) for row in rows]
+    has_more = fast and len(files) > max_results
+    if has_more:
+        files = files[:max_results]
+    next_offset = offset + max_results
+    if fast:
+        total_results = offset + len(files) + (1 if has_more else 0)
+        if not has_more:
+            next_offset = ''
+    elif next_offset >= total_results:
+        next_offset = ''
+    return files, next_offset, total_results
 
 def _cache_get(key):
     cached = _SEARCH_CACHE.get(key)
@@ -255,6 +391,8 @@ class SQLMediaCollection:
                 conn.execute(text("DELETE FROM media WHERE file_id=:fid"), {"fid": fid})
         for fid in ids:
             _uncache_doc(fid)
+        if _disk_cache_enabled() and _DISK_CACHE_READY:
+            await asyncio.to_thread(_disk_delete_many_sync, ids)
         _SEARCH_CACHE.clear()
         return SQLDeleteResult(len(ids))
 
@@ -266,15 +404,20 @@ class SQLMediaCollection:
         with store.begin() as conn:
             conn.execute(text("DELETE FROM media WHERE file_id=:fid"), {"fid": fid})
         _uncache_doc(fid)
+        if _disk_cache_enabled() and _DISK_CACHE_READY:
+            await asyncio.to_thread(_disk_delete_many_sync, [fid])
         _SEARCH_CACHE.clear()
         return SQLDeleteResult(1)
 
     async def drop(self):
-        global _MEDIA_CACHE_COMPLETE
+        global _MEDIA_CACHE_COMPLETE, _DISK_CACHE_COMPLETE
         with store.begin() as conn:
             conn.execute(text("DELETE FROM media"))
         _MEDIA_CACHE.clear()
         _MEDIA_CACHE_COMPLETE = True
+        if _disk_cache_enabled() and _DISK_CACHE_READY:
+            await asyncio.to_thread(_disk_clear_sync)
+            _DISK_CACHE_COMPLETE = True
         _SEARCH_CACHE.clear()
 
 
@@ -394,10 +537,13 @@ if USE_MONGO:
             return SQLDeleteResult(deleted)
 
         async def drop(self):
-            global _MEDIA_CACHE_COMPLETE
+            global _MEDIA_CACHE_COMPLETE, _DISK_CACHE_COMPLETE
             await asyncio.gather(*[col.drop() for col in _mongo_collections])
             _MEDIA_CACHE.clear()
             _MEDIA_CACHE_COMPLETE = True
+            if _disk_cache_enabled() and _DISK_CACHE_READY:
+                await asyncio.to_thread(_disk_clear_sync)
+                _DISK_CACHE_COMPLETE = True
             _SEARCH_CACHE.clear()
 
     class Media:
@@ -428,6 +574,8 @@ if USE_MONGO:
             q = query or {}
             if _MEDIA_CACHE_COMPLETE:
                 return sum(1 for doc in _MEDIA_CACHE.values() if _match_filter(doc, q))
+            if _DISK_CACHE_COMPLETE and not q:
+                return await asyncio.to_thread(_disk_count_all_sync)
             if MONGO_SHARD_COUNT == 1:
                 return await _mongo_collections[0].count_documents(q)
             counts = await asyncio.gather(*[col.count_documents(q) for col in _mongo_collections])
@@ -469,8 +617,8 @@ else:
 
 
 async def preload_media_cache(force=False):
-    """Warm a bounded media cache after deploy/restart without exhausting RAM."""
-    global _MEDIA_CACHE_READY, _MEDIA_CACHE_COMPLETE
+    """Warm media caches after deploy/restart without exhausting RAM."""
+    global _MEDIA_CACHE_READY, _MEDIA_CACHE_COMPLETE, _DISK_CACHE_READY, _DISK_CACHE_COMPLETE
     if _MEDIA_CACHE_READY and not force:
         return len(_MEDIA_CACHE)
     async with _MEDIA_CACHE_LOCK:
@@ -479,7 +627,34 @@ async def preload_media_cache(force=False):
 
         _MEDIA_CACHE.clear()
         _MEDIA_CACHE_COMPLETE = False
+        _DISK_CACHE_COMPLETE = False
         cache_limit = max(int(MEDIA_CACHE_MAX or 0), 0)
+
+        if _disk_cache_enabled() and USE_MONGO:
+            await asyncio.to_thread(_disk_init_sync, True)
+            projection = {
+                'file_ref': 1, 'file_name': 1, 'file_size': 1, 'file_type': 1,
+                'mime_type': 1, 'caption': 1, 'created_at': 1,
+            }
+            total = 0
+            batch = []
+            for col in _mongo_collections:
+                cursor = col.find({}, projection).batch_size(500)
+                async for doc in cursor:
+                    batch.append(doc)
+                    if len(batch) >= 1000:
+                        total += await asyncio.to_thread(_disk_upsert_many_sync, batch)
+                        batch = []
+                if batch:
+                    total += await asyncio.to_thread(_disk_upsert_many_sync, batch)
+                    batch = []
+            _DISK_CACHE_READY = True
+            _DISK_CACHE_COMPLETE = True
+            _MEDIA_CACHE_READY = True
+            _SEARCH_CACHE.clear()
+            logger.info('Mirrored %d media records into disk cache at %s', total, _disk_cache_path())
+            return total
+
         if cache_limit <= 0:
             _MEDIA_CACHE_READY = True
             _SEARCH_CACHE.clear()
@@ -569,6 +744,8 @@ async def save_file(media):
         try:
             await _target_collection(file_id).insert_one(doc)
             _cache_doc(doc)
+            if _disk_cache_enabled() and _DISK_CACHE_READY:
+                await asyncio.to_thread(_disk_upsert_many_sync, [doc])
             _SEARCH_CACHE.clear()
         except DuplicateKeyError:
             logger.warning(f'{getattr(media, "file_name", "NO_FILE")} is already saved in database')
@@ -598,7 +775,7 @@ async def save_file(media):
                 "caption": media.caption.html if media.caption else None,
             },
         )
-    _cache_doc({
+    doc = {
         '_id': file_id,
         'file_ref': file_ref,
         'file_name': file_name,
@@ -607,7 +784,10 @@ async def save_file(media):
         'mime_type': media.mime_type,
         'caption': media.caption.html if media.caption else None,
         'created_at': time.time(),
-    })
+    }
+    _cache_doc(doc)
+    if _disk_cache_enabled() and _DISK_CACHE_READY:
+        await asyncio.to_thread(_disk_upsert_many_sync, [doc])
     _SEARCH_CACHE.clear()
     return True, 1
 
@@ -782,6 +962,11 @@ async def get_search_results(
         'caption': 1,
         'created_at': 1,
     }
+
+    if _DISK_CACHE_COMPLETE:
+        result = await asyncio.to_thread(_disk_search_sync, query, file_type, max_results, offset, fast)
+        _cache_set(cache_key, result)
+        return _finish_search(*result, started_at, return_time)
 
     if _MEDIA_CACHE_COMPLETE:
         matched = [d for d in _MEDIA_CACHE.values() if _match_filter(d, search_filter)]
