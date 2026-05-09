@@ -256,78 +256,119 @@ def _pick_keeper(docs):
     return max(docs, key=lambda d: (int(d.get('file_size') or 0), float(d.get('created_at') or 0)))
 
 
-async def _load_duplicate_candidates():
-    candidates = []
-    seen_ids = {}
-    id_dupes = []
+def _delete_op_for_doc(doc):
+    if USE_MONGO and doc.get('_col') is not None:
+        return ('shard', int(doc['_col']), doc['_id'])
+    return ('id', doc['_id'])
 
-    def _add_doc(doc):
+
+def _mark_duplicate(doc, duplicate_ops, duplicate_seen):
+    op = _delete_op_for_doc(doc)
+    if op not in duplicate_seen:
+        duplicate_seen.add(op)
+        duplicate_ops.append(op)
+
+
+def _add_duplicate_candidate(doc, groups, duplicate_ops, duplicate_seen):
+    key = _duplicate_key(doc)
+    if not key or not key[1]:
+        return 0
+
+    buckets = groups.setdefault(key, [])
+    for bucket in buckets:
+        if not _same_size(doc.get('file_size'), bucket['keeper'].get('file_size')):
+            continue
+        was_single = bucket['count'] == 1
+        current_keeper = bucket['keeper']
+        better = _pick_keeper([current_keeper, doc])
+        if better['_id'] == doc['_id']:
+            _mark_duplicate(current_keeper, duplicate_ops, duplicate_seen)
+            bucket['keeper'] = doc
+        else:
+            _mark_duplicate(doc, duplicate_ops, duplicate_seen)
+        bucket['count'] += 1
+        return 1 if was_single else 0
+
+    buckets.append({'keeper': doc, 'count': 1})
+    return 0
+
+
+async def _scan_duplicate_ops(status=None):
+    groups = {}
+    seen_ids = {}
+    duplicate_ops = []
+    duplicate_seen = set()
+    checked = duplicate_sets = 0
+    last_edit = 0
+
+    async def _progress(force=False):
+        nonlocal last_edit
+        now = asyncio.get_running_loop().time()
+        if not status or (not force and now - last_edit < 5):
+            return
+        last_edit = now
+        try:
+            await status.edit_text(
+                "🔍 Scanning DB for duplicate files...\n\n"
+                f"Checked: <code>{checked}</code>\n"
+                f"Duplicate groups: <code>{duplicate_sets}</code>\n"
+                f"Duplicate files found: <code>{len(duplicate_ops)}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    def _make_doc(doc, col_idx=None):
         fid = doc.get('_id') or doc.get('file_id')
         if not fid:
-            return
-        item = {
+            return None
+        return {
             '_id': fid,
+            '_col': col_idx,
             'file_name': doc.get('file_name') or '',
             'file_size': int(doc.get('file_size') or 0),
             'created_at': float(doc.get('created_at') or 0),
         }
+
+    async def _handle_doc(doc, col_idx=None):
+        nonlocal checked, duplicate_sets
+        item = _make_doc(doc, col_idx=col_idx)
+        if not item:
+            return
+        checked += 1
+        fid = item['_id']
         if fid in seen_ids:
-            id_dupes.append(item)
+            # Same file_id duplicated across Mongo shards: delete only this shard copy.
+            _mark_duplicate(item, duplicate_ops, duplicate_seen)
         else:
             seen_ids[fid] = item
-            candidates.append(item)
+            duplicate_sets += _add_duplicate_candidate(item, groups, duplicate_ops, duplicate_seen)
+        if checked % 1000 == 0:
+            await _progress()
+            await asyncio.sleep(0)
 
     if USE_MONGO:
         import database.ia_filterdb as media_db
         projection = {'file_name': 1, 'file_size': 1, 'created_at': 1}
-        for col in media_db._mongo_collections:
-            cursor = col.find({}, projection).batch_size(1000)
+        for col_idx, col in enumerate(media_db._mongo_collections):
+            cursor = col.find({}, projection).batch_size(500)
             async for doc in cursor:
-                _add_doc(doc)
+                await _handle_doc(doc, col_idx=col_idx)
     else:
         from database.sql_store import store
         from sqlalchemy import text as sa_text
 
         with store.begin() as conn:
-            rows = conn.execute(
-                sa_text("SELECT file_id, file_name, file_size, created_at FROM media")
-            ).fetchall()
-        for row in rows:
-            _add_doc({'_id': row[0], 'file_name': row[1], 'file_size': row[2], 'created_at': row[3]})
-
-    return candidates, id_dupes
-
-
-def _find_duplicate_ids(candidates, id_dupes):
-    groups = {}
-    for doc in candidates:
-        key = _duplicate_key(doc)
-        if not key or not key[1]:
-            continue
-        groups.setdefault(key, []).append(doc)
-
-    duplicate_ids = {doc['_id'] for doc in id_dupes}
-    duplicate_sets = 0
-    for docs in groups.values():
-        if len(docs) < 2:
-            continue
-        buckets = []
-        for doc in sorted(docs, key=lambda d: int(d.get('file_size') or 0)):
-            for bucket in buckets:
-                if _same_size(doc.get('file_size'), bucket[0].get('file_size')):
-                    bucket.append(doc)
+            result = conn.execute(sa_text("SELECT file_id, file_name, file_size, created_at FROM media"))
+            while True:
+                rows = result.fetchmany(500)
+                if not rows:
                     break
-            else:
-                buckets.append([doc])
-        for bucket in buckets:
-            if len(bucket) < 2:
-                continue
-            keeper = _pick_keeper(bucket)
-            remove = [doc['_id'] for doc in bucket if doc['_id'] != keeper['_id']]
-            if remove:
-                duplicate_sets += 1
-                duplicate_ids.update(remove)
-    return list(duplicate_ids), duplicate_sets
+                for row in rows:
+                    await _handle_doc({'_id': row[0], 'file_name': row[1], 'file_size': row[2], 'created_at': row[3]})
+
+    await _progress(force=True)
+    return checked, duplicate_ops, duplicate_sets
 
 
 @Client.on_message(filters.command("deleteduplicates") & filters.user(ADMINS))
@@ -336,18 +377,17 @@ async def delete_duplicate_files(bot: Client, message: Message):
         return await message.reply_text("<b>This command only works in my PM.</b>", parse_mode=enums.ParseMode.HTML)
 
     status = await message.reply_text("🔍 Scanning DB for duplicate files...", quote=True)
-    candidates, id_dupes = await _load_duplicate_candidates()
-    duplicate_ids, duplicate_sets = _find_duplicate_ids(candidates, id_dupes)
+    checked, duplicate_ops, duplicate_sets = await _scan_duplicate_ops(status)
 
-    if not duplicate_ids:
-        return await status.edit_text(f"✅ Scan complete. Checked <code>{len(candidates)}</code> files. No duplicates found.")
+    if not duplicate_ops:
+        return await status.edit_text(f"✅ Scan complete. Checked <code>{checked}</code> files. No duplicates found.")
 
-    DUP_SCAN_CACHE[message.from_user.id] = duplicate_ids
+    DUP_SCAN_CACHE[message.from_user.id] = duplicate_ops
     await status.edit_text(
         "⚠️ Duplicate scan complete.\n\n"
-        f"Checked files: <code>{len(candidates)}</code>\n"
+        f"Checked files: <code>{checked}</code>\n"
         f"Duplicate groups: <code>{duplicate_sets}</code>\n"
-        f"Duplicate files to delete: <code>{len(duplicate_ids)}</code>\n\n"
+        f"Duplicate files to delete: <code>{len(duplicate_ops)}</code>\n\n"
         "Language-aware matching is enabled, so Malayalam/Tamil/etc. versions are kept separately.\n"
         "Continue deletion?",
         reply_markup=InlineKeyboardMarkup([
@@ -373,15 +413,30 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
     await query.answer("Deleting duplicates...")
     deleted = 0
     total = len(ids)
-    for start in range(0, total, DUP_BATCH_DELETE):
-        batch = ids[start:start + DUP_BATCH_DELETE]
+    id_ops = [op[1] for op in ids if op[0] == 'id']
+    shard_ops = [op for op in ids if op[0] == 'shard']
+
+    for start in range(0, len(id_ops), DUP_BATCH_DELETE):
+        batch = id_ops[start:start + DUP_BATCH_DELETE]
         result = await Media.collection.delete_many({'_id': {'$in': batch}})
         deleted += result.deleted_count
         await query.message.edit_text(
             f"🗑️ Deleted <code>{deleted}</code>/<code>{total}</code> duplicate files...",
             parse_mode=enums.ParseMode.HTML,
         )
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
+
+    if shard_ops and USE_MONGO:
+        import database.ia_filterdb as media_db
+        for _, col_idx, file_id in shard_ops:
+            result = await media_db._mongo_collections[col_idx].delete_one({'_id': file_id})
+            deleted += result.deleted_count
+            if deleted % DUP_BATCH_DELETE == 0:
+                await query.message.edit_text(
+                    f"🗑️ Deleted <code>{deleted}</code>/<code>{total}</code> duplicate files...",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                await asyncio.sleep(0.1)
     await query.message.edit_text(
         f"✅ Duplicate cleanup finished. Deleted <code>{deleted}</code> files.",
         parse_mode=enums.ParseMode.HTML,
