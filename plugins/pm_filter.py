@@ -437,9 +437,7 @@ async def cb_handler(client: Client, query: CallbackQuery):
         pm_url = _bot_start_url(f"{ident}_{file_id}")
         try:
             if not await is_subscribed(query.from_user.id, client):
-                invite_links = await create_invite_links(client)
-                first_link = next(iter(invite_links.values()), _bot_start_url())
-                await _answer_url_or_alert(query, first_link, "Join the required channel and try again.")
+                await _answer_url_or_alert(query, pm_url, "Open the bot PM and try again.")
                 return
             await _answer_url_or_alert(query, pm_url, "Open the bot PM and try again.")
         except UserIsBlocked:
