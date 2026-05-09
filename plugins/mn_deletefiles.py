@@ -170,8 +170,10 @@ async def close_message(bot: Client, query: CallbackQuery):
 # ─── duplicate cleanup ───────────────────────────────────────────────────────
 DUP_SCAN_CACHE = {}
 DUP_SCAN_LOCK = asyncio.Lock()
-DUP_BATCH_DELETE = 500
-DUP_PROGRESS_EVERY = 30
+DUP_SCAN_BATCH = 2000
+DUP_BATCH_DELETE = 2000
+DUP_PROGRESS_EVERY = 8
+SIZE_BUCKET_BYTES = 10 * 1024 * 1024
 LANG_ALIASES = {
     "malayalam": "mal", "mal": "mal", "ml": "mal",
     "tamil": "tam", "tam": "tam", "ta": "tam",
@@ -290,28 +292,39 @@ def _add_duplicate_candidate(doc, groups, duplicate_ops, duplicate_seen):
     if not key or not key[1]:
         return 0
 
-    buckets = groups.setdefault(key, [])
-    for bucket in buckets:
-        if not _same_size(doc.get('file_size'), bucket['keeper'].get('file_size')):
-            continue
-        was_single = bucket['count'] == 1
-        current_keeper = bucket['keeper']
-        better = _pick_keeper([current_keeper, doc])
-        if better['_id'] == doc['_id']:
-            _mark_duplicate(current_keeper, duplicate_ops, duplicate_seen)
-            bucket['keeper'] = doc
-        else:
-            _mark_duplicate(doc, duplicate_ops, duplicate_seen)
-        bucket['count'] += 1
-        return 1 if was_single else 0
+    file_size = int(doc.get('file_size') or 0)
+    size_bucket = 0 if file_size <= 0 else file_size // SIZE_BUCKET_BYTES
+    first_free_key = None
 
-    buckets.append({'keeper': doc, 'count': 1})
+    for near_bucket in (size_bucket, size_bucket - 1, size_bucket + 1):
+        slot = 0
+        while True:
+            grouped_key = (*key, near_bucket, slot)
+            bucket = groups.get(grouped_key)
+            if not bucket:
+                if first_free_key is None and near_bucket == size_bucket:
+                    first_free_key = grouped_key
+                break
+            if _same_size(file_size, bucket['keeper'].get('file_size')):
+                was_single = bucket['count'] == 1
+                current_keeper = bucket['keeper']
+                better = _pick_keeper([current_keeper, doc])
+                if better['_id'] == doc['_id']:
+                    _mark_duplicate(current_keeper, duplicate_ops, duplicate_seen)
+                    bucket['keeper'] = doc
+                else:
+                    _mark_duplicate(doc, duplicate_ops, duplicate_seen)
+                bucket['count'] += 1
+                return 1 if was_single else 0
+            slot += 1
+
+    groups[first_free_key or (*key, size_bucket, 0)] = {'keeper': doc, 'count': 1}
     return 0
 
 
 async def _scan_duplicate_ops(status=None):
     groups = {}
-    seen_ids = {}
+    seen_ids = set()
     duplicate_ops = []
     duplicate_seen = set()
     checked = duplicate_sets = 0
@@ -347,7 +360,7 @@ async def _scan_duplicate_ops(status=None):
             'created_at': float(doc.get('created_at') or 0),
         }
 
-    async def _handle_doc(doc, col_idx=None):
+    def _handle_doc(doc, col_idx=None):
         nonlocal checked, duplicate_sets
         item = _make_doc(doc, col_idx=col_idx)
         if not item:
@@ -357,20 +370,20 @@ async def _scan_duplicate_ops(status=None):
         if fid in seen_ids:
             # Same file_id duplicated across Mongo shards: delete only this shard copy.
             _mark_duplicate(item, duplicate_ops, duplicate_seen)
-        else:
-            seen_ids[fid] = item
-            duplicate_sets += _add_duplicate_candidate(item, groups, duplicate_ops, duplicate_seen)
-        if checked % 100 == 0:
-            await _progress()
-            await asyncio.sleep(0.01)
+            return
+        seen_ids.add(fid)
+        duplicate_sets += _add_duplicate_candidate(item, groups, duplicate_ops, duplicate_seen)
 
     if USE_MONGO:
         import database.ia_filterdb as media_db
         projection = {'file_name': 1, 'file_size': 1, 'created_at': 1}
         for col_idx, col in enumerate(media_db._mongo_collections):
-            cursor = col.find({}, projection).batch_size(500)
+            cursor = col.find({}, projection).batch_size(DUP_SCAN_BATCH)
             async for doc in cursor:
-                await _handle_doc(doc, col_idx=col_idx)
+                _handle_doc(doc, col_idx=col_idx)
+                if checked % DUP_SCAN_BATCH == 0:
+                    await _progress()
+                    await asyncio.sleep(0)
     else:
         from database.sql_store import store
         from sqlalchemy import text as sa_text
@@ -378,11 +391,13 @@ async def _scan_duplicate_ops(status=None):
         with store.begin() as conn:
             result = conn.execute(sa_text("SELECT file_id, file_name, file_size, created_at FROM media"))
             while True:
-                rows = result.fetchmany(500)
+                rows = result.fetchmany(DUP_SCAN_BATCH)
                 if not rows:
                     break
                 for row in rows:
-                    await _handle_doc({'_id': row[0], 'file_name': row[1], 'file_size': row[2], 'created_at': row[3]})
+                    _handle_doc({'_id': row[0], 'file_name': row[1], 'file_size': row[2], 'created_at': row[3]})
+                await _progress()
+                await asyncio.sleep(0)
 
     await _progress(force=True)
     return checked, duplicate_ops, duplicate_sets
@@ -452,12 +467,30 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
             parse_mode=enums.ParseMode.HTML,
         )
 
-    for start in range(0, len(id_ops), DUP_BATCH_DELETE):
-        batch = id_ops[start:start + DUP_BATCH_DELETE]
-        result = await Media.collection.delete_many({'_id': {'$in': batch}})
-        deleted += result.deleted_count
-        await _delete_progress()
-        await asyncio.sleep(0.1)
+    if id_ops and USE_MONGO:
+        for start in range(0, len(id_ops), DUP_BATCH_DELETE):
+            batch = id_ops[start:start + DUP_BATCH_DELETE]
+            result = await Media.collection.delete_many({'_id': {'$in': batch}})
+            deleted += result.deleted_count
+            await _delete_progress()
+            await asyncio.sleep(0)
+    elif id_ops:
+        from database.sql_store import store
+        from sqlalchemy import text as sa_text
+        import database.ia_filterdb as media_db
+
+        for start in range(0, len(id_ops), DUP_BATCH_DELETE):
+            batch = id_ops[start:start + DUP_BATCH_DELETE]
+            with store.begin() as conn:
+                result = conn.execute(sa_text("DELETE FROM media WHERE file_id = ANY(:ids)"), {"ids": batch})
+                deleted += result.rowcount or 0
+            for fid in batch:
+                media_db._uncache_doc(fid)
+            if media_db._disk_cache_enabled() and media_db._DISK_CACHE_READY:
+                await asyncio.to_thread(media_db._disk_delete_many_sync, batch)
+            media_db._SEARCH_CACHE.clear()
+            await _delete_progress()
+            await asyncio.sleep(0)
 
     if shard_ops and USE_MONGO:
         import database.ia_filterdb as media_db
@@ -471,7 +504,7 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
                 result = await col.delete_many({'_id': {'$in': batch}})
                 deleted += result.deleted_count
                 await _delete_progress()
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0)
 
     await _safe_edit_duplicate_status(
         query.message,
