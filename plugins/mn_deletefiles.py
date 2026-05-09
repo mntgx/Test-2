@@ -9,7 +9,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
-from database.ia_filterdb import Media, USE_MONGO
+from database.ia_filterdb import Media, USE_MONGO, duplicate_key_for_doc, duplicate_sizes_match
 from info import ADMINS
 
 logger = logging.getLogger(__name__)
@@ -171,7 +171,6 @@ async def close_message(bot: Client, query: CallbackQuery):
     await query.message.delete()
 
 # ─── duplicate cleanup ───────────────────────────────────────────────────────
-DUP_SCAN_CACHE = {}
 DUP_SCAN_LOCK = asyncio.Lock()
 DUP_SCAN_BATCH = 1000
 DUP_DB_COMMIT_EVERY = 1000
@@ -179,87 +178,13 @@ DUP_BATCH_DELETE = 500
 DUP_PROGRESS_EVERY = 20
 SIZE_BUCKET_BYTES = 10 * 1024 * 1024
 DUP_KEY_SEP = "\x1f"
-LANG_ALIASES = {
-    "malayalam": "mal", "mal": "mal", "ml": "mal",
-    "tamil": "tam", "tam": "tam", "ta": "tam",
-    "hindi": "hin", "hin": "hin", "hi": "hin",
-    "english": "eng", "eng": "eng", "en": "eng",
-    "telugu": "tel", "tel": "tel", "te": "tel",
-    "kannada": "kan", "kan": "kan", "kn": "kan",
-}
-LANG_RE = re.compile(r"\b(" + "|".join(map(re.escape, sorted(LANG_ALIASES, key=len, reverse=True))) + r")\b", re.I)
-SERIES_TOKEN_RE = re.compile(
-    r"(?:\bS(?P<s1>\d{1,2})\s*E(?P<e1>\d{1,3})\b|\bSeason\s*(?P<s2>\d{1,2}).*?\b(?:Episode|Ep|E)\s*(?P<e2>\d{1,3})\b)",
-    re.I,
-)
-DROP_WORDS_RE = re.compile(
-    r"\b(\d{3,4}p|4k|x264|x265|hevc|h\.?264|h\.?265|aac|ddp?\d?\.\d|web[- ]?dl|webrip|hdrip|bluray|brrip|dvdrip|proper|repack|esub|multi|org|original|uncut)\b",
-    re.I,
-)
-
-
-def _clean_dup_name(name: str) -> str:
-    raw = str(name or "").lower()
-    raw = re.sub(r"\.[a-z0-9]{2,4}$", " ", raw)
-    raw = re.sub(r"@\w+", " ", raw)
-    raw = re.sub(r"https?://\S+|www\.\S+", " ", raw)
-    raw = re.sub(
-        r"^[\[\(]([^\]\)]{1,25})[\]\)]\s*",
-        lambda m: f" {m.group(1)} " if SERIES_TOKEN_RE.search(m.group(1)) else " ",
-        raw,
-    )
-    raw = DROP_WORDS_RE.sub(" ", raw)
-    raw = re.sub(r"[._+\-]+", " ", raw)
-    raw = re.sub(r"[^a-z0-9\s]", " ", raw)
-    return re.sub(r"\s+", " ", raw).strip()
-
-
-def _detect_lang(clean_name: str) -> str:
-    found = []
-    for match in LANG_RE.finditer(clean_name):
-        code = LANG_ALIASES.get(match.group(1).lower())
-        if code and code not in found:
-            found.append(code)
-    return "+".join(found) if found else "unknown"
-
-
-def _series_parts(clean_name: str):
-    match = SERIES_TOKEN_RE.search(clean_name)
-    if not match:
-        return None
-    season = int(match.group('s1') or match.group('s2') or 0)
-    episode = int(match.group('e1') or match.group('e2') or 0)
-    before = clean_name[:match.start()].strip()
-    after = clean_name[match.end():].strip()
-    title = before if len(before) >= 3 else after
-    title = LANG_RE.sub(" ", title)
-    title = re.sub(r"\b(19|20)\d{2}\b", " ", title)
-    title = re.sub(r"\s+", " ", title).strip()
-    return title, season, episode
-
-
-def _movie_title(clean_name: str):
-    title = SERIES_TOKEN_RE.sub(" ", clean_name)
-    title = LANG_RE.sub(" ", title)
-    return re.sub(r"\s+", " ", title).strip()
-
 
 def _duplicate_key(doc):
-    clean_name = _clean_dup_name(doc.get('file_name'))
-    lang = _detect_lang(clean_name)
-    series = _series_parts(clean_name)
-    if series:
-        title, season, episode = series
-        if not title:
-            title = _movie_title(clean_name)
-        return ("series", title, lang, season, episode)
-    return ("movie", _movie_title(clean_name), lang)
+    return duplicate_key_for_doc(doc)
 
 
 def _same_size(left: int, right: int) -> bool:
-    if not left or not right:
-        return True
-    return abs(int(left) - int(right)) <= max(10 * 1024 * 1024, int(min(int(left), int(right)) * 0.02))
+    return duplicate_sizes_match(left, right)
 
 
 def _pick_keeper(docs):
@@ -480,57 +405,8 @@ async def _scan_duplicate_ops(status=None):
         conn.close()
 
 
-@Client.on_message(filters.command("deleteduplicates") & filters.user(ADMINS))
-async def delete_duplicate_files(bot: Client, message: Message):
-    if message.chat.type != enums.ChatType.PRIVATE:
-        return await message.reply_text("<b>This command only works in my PM.</b>", parse_mode=enums.ParseMode.HTML)
 
-    if DUP_SCAN_LOCK.locked():
-        return await message.reply_text("⚠️ Duplicate cleanup is already running. Please wait until it finishes.")
-
-    status = await message.reply_text("🔍 Scanning DB for duplicate files...", quote=True)
-    async with DUP_SCAN_LOCK:
-        scan_info, checked, duplicate_count, duplicate_sets = await _scan_duplicate_ops(status)
-
-    if not duplicate_count:
-        _remove_scan_file(scan_info.get('path'))
-        return await _safe_edit_duplicate_status(status, f"✅ Scan complete. Checked <code>{checked}</code> files. No duplicates found.")
-
-    old_scan = DUP_SCAN_CACHE.pop(message.from_user.id, None)
-    if old_scan:
-        _remove_scan_file(old_scan.get('path'))
-    DUP_SCAN_CACHE[message.from_user.id] = scan_info
-    await _safe_edit_duplicate_status(
-        status,
-        "⚠️ Duplicate scan complete.\n\n"
-        f"Checked files: <code>{checked}</code>\n"
-        f"Duplicate groups: <code>{duplicate_sets}</code>\n"
-        f"Duplicate files to delete: <code>{duplicate_count}</code>\n\n"
-        "Language-aware matching is enabled, so Malayalam/Tamil/etc. versions are kept separately.\n"
-        "Continue deletion?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Delete duplicates", callback_data=f"dupedel:yes:{message.from_user.id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"dupedel:no:{message.from_user.id}")],
-        ]),
-        parse_mode=enums.ParseMode.HTML,
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^dupedel:(yes|no):(\d+)$"))
-async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
-    action, owner = query.matches[0].group(1), int(query.matches[0].group(2))
-    if query.from_user.id != owner:
-        return await query.answer("This duplicate cleanup is not for you.", show_alert=True)
-    scan_info = DUP_SCAN_CACHE.pop(owner, None)
-    if action == "no":
-        if scan_info:
-            _remove_scan_file(scan_info.get('path'))
-        await query.answer("Cancelled")
-        return await _safe_edit_duplicate_status(query.message, "❌ Duplicate deletion cancelled.")
-    if not scan_info or not scan_info.get('path') or not os.path.exists(scan_info.get('path')):
-        return await _safe_edit_duplicate_status(query.message, "No cached duplicate scan found. Run /deleteduplicates again.")
-
-    await query.answer("Deleting duplicates...")
+async def _delete_duplicate_scan(message, scan_info):
     deleted = 0
     total = int(scan_info.get('total') or 0)
     last_delete_edit = 0
@@ -542,7 +418,7 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
             return
         last_delete_edit = now
         await _safe_edit_duplicate_status(
-            query.message,
+            message,
             f"🗑️ Deleted <code>{deleted}</code>/<code>{total}</code> duplicate files...",
             parse_mode=enums.ParseMode.HTML,
         )
@@ -619,7 +495,36 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
         _remove_scan_file(scan_info.get('path'))
 
     await _safe_edit_duplicate_status(
-        query.message,
+        message,
         f"✅ Duplicate cleanup finished. Deleted <code>{deleted}</code> files.",
         parse_mode=enums.ParseMode.HTML,
     )
+
+
+
+@Client.on_message(filters.command("deleteduplicates") & filters.user(ADMINS))
+async def delete_duplicate_files(bot: Client, message: Message):
+    if message.chat.type != enums.ChatType.PRIVATE:
+        return await message.reply_text("<b>This command only works in my PM.</b>", parse_mode=enums.ParseMode.HTML)
+
+    if DUP_SCAN_LOCK.locked():
+        return await message.reply_text("⚠️ Duplicate cleanup is already running. Please wait until it finishes.")
+
+    status = await message.reply_text("🔍 Scanning DB for duplicate files...", quote=True)
+    async with DUP_SCAN_LOCK:
+        scan_info, checked, duplicate_count, duplicate_sets = await _scan_duplicate_ops(status)
+
+        if not duplicate_count:
+            _remove_scan_file(scan_info.get('path'))
+            return await _safe_edit_duplicate_status(status, f"✅ Scan complete. Checked <code>{checked}</code> files. No duplicates found.")
+
+        await _safe_edit_duplicate_status(
+            status,
+            "⚠️ Duplicate scan complete. Deleting now...\n\n"
+            f"Checked files: <code>{checked}</code>\n"
+            f"Duplicate groups: <code>{duplicate_sets}</code>\n"
+            f"Duplicate files to delete: <code>{duplicate_count}</code>\n\n"
+            "Language-aware matching is enabled, so Malayalam/Tamil/multi/etc. versions are kept separately.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        await _delete_duplicate_scan(status, scan_info)

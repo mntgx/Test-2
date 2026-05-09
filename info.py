@@ -87,6 +87,7 @@ INDEX_MODE = environ.get('INDEX_MODE', 'both').strip().lower()
 MEDIA_CACHE_MAX = int(environ.get('MEDIA_CACHE_MAX', 0))
 DISK_MEDIA_CACHE = is_enabled(environ.get('DISK_MEDIA_CACHE', 'True'), True)
 DISK_MEDIA_CACHE_PATH = environ.get('DISK_MEDIA_CACHE_PATH', '/tmp/media_cache.sqlite3')
+ADVANCED_DUPLICATE_SKIP = is_enabled(environ.get('ADVANCED_DUPLICATE_SKIP', 'False'), False)
 MOVIES_REQUEST_GROUP = environ.get('MOVIES_REQUEST_GROUP', '@malayalam_2022')
 SERIES_REQUEST_GROUP = environ.get('SERIES_REQUEST_GROUP', '@seriesgroup')
 

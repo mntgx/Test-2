@@ -19,7 +19,7 @@ from info import (
     DATABASE_URI, DATABASE_NAME, COLLECTION_NAME, USE_CAPTION_FILTER,
     DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5,
     DATABASE_NAME2, DATABASE_NAME3, DATABASE_NAME4, DATABASE_NAME5, INDEX_MODE, MEDIA_CACHE_MAX,
-    DISK_MEDIA_CACHE, DISK_MEDIA_CACHE_PATH,
+    DISK_MEDIA_CACHE, DISK_MEDIA_CACHE_PATH, ADVANCED_DUPLICATE_SKIP,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,118 @@ _SEARCH_CACHE = OrderedDict()
 BAD_RELEASE_TAGS = (
     'predvdrip', 'camrip', 'hdts', 'prehd', 'dvdscr', 'hq real',
 )
+
+DUP_LANG_ALIASES = {
+    "multi": "multi", "multi audio": "multi", "multi language": "multi", "multilingual": "multi",
+    "dual": "multi", "dual audio": "multi", "tri audio": "multi", "triple audio": "multi",
+    "malayalam": "mal", "mal": "mal", "ml": "mal", "mallu": "mal",
+    "tamil": "tam", "tam": "tam", "ta": "tam",
+    "hindi": "hin", "hin": "hin", "hi": "hin", "bollywood": "hin",
+    "english": "eng", "eng": "eng", "en": "eng",
+    "telugu": "tel", "tel": "tel", "te": "tel",
+    "kannada": "kan", "kan": "kan", "kn": "kan",
+    "bengali": "ben", "bangla": "ben", "ben": "ben", "bn": "ben",
+    "marathi": "mar", "mar": "mar", "mr": "mar",
+    "punjabi": "pan", "pun": "pan", "pan": "pan", "pa": "pan",
+    "gujarati": "guj", "guj": "guj", "gu": "guj",
+    "odia": "ori", "oriya": "ori", "ori": "ori",
+    "assamese": "asm", "assam": "asm", "asm": "asm",
+    "urdu": "urd", "urd": "urd", "ur": "urd",
+    "bhojpuri": "bho", "bho": "bho",
+    "nepali": "nep", "nep": "nep", "ne": "nep",
+    "sinhala": "sin", "sinhalese": "sin", "sin": "sin", "si": "sin",
+    "arabic": "ara", "ara": "ara", "ar": "ara",
+    "korean": "kor", "kor": "kor", "ko": "kor",
+    "japanese": "jpn", "jpn": "jpn", "ja": "jpn",
+    "chinese": "chi", "mandarin": "chi", "chi": "chi", "zh": "chi",
+    "french": "fre", "fr": "fre", "spanish": "spa", "es": "spa",
+    "german": "ger", "de": "ger", "russian": "rus", "ru": "rus",
+    "thai": "tha", "th": "tha", "indonesian": "ind", "indo": "ind",
+}
+DUP_LANG_RE = re.compile(r"\b(" + "|".join(map(re.escape, sorted(DUP_LANG_ALIASES, key=len, reverse=True))) + r")\b", re.I)
+DUP_SERIES_TOKEN_RE = re.compile(
+    r"(?:"
+    r"\bS(?P<s1>\d{1,2})\s*(?:E|EP|EPISODE)\s*(?P<e1>\d{1,3})\b|"
+    r"\bS(?P<s5>\d{1,2})\s*[.\-_ ]+\s*(?P<e5>\d{1,3})\b|"
+    r"\b(?P<s3>\d{1,2})\s*x\s*(?P<e3>\d{1,3})\b|"
+    r"\bSeason\s*(?P<s2>\d{1,2}).*?\b(?:Episode|Ep|E)\s*(?P<e2>\d{1,3})\b|"
+    r"\bSeason\s*(?P<s4>\d{1,2})\b|"
+    r"\b(?:Episode|Ep)\s*(?P<e4>\d{1,3})\b"
+    r")",
+    re.I,
+)
+DUP_DROP_WORDS_RE = re.compile(
+    r"\b(\d{3,4}p|2160p|1080p|720p|480p|4k|uhd|hdr|hdr10|dv|dolby|atmos|x264|x265|hevc|avc|h\.?264|h\.?265|aac|ac3|eac3|ddp?\d?(?:\.\d)?|5\.1|7\.1|web[- ]?dl|web[- ]?rip|webrip|hdrip|bluray|blu[- ]?ray|brrip|dvdrip|hdtv|proper|repack|remux|extended|unrated|uncut|theatrical|imax|esub|subs?|dubbed|org|original|cleaned|hq|hd|sd)\b",
+    re.I,
+)
+
+
+def clean_duplicate_name(name: str) -> str:
+    raw = str(name or "").lower()
+    raw = re.sub(r"\.[a-z0-9]{2,4}$", " ", raw)
+    raw = re.sub(r"@\w+", " ", raw)
+    raw = re.sub(r"https?://\S+|www\.\S+", " ", raw)
+    raw = re.sub(
+        r"^[\[\(]([^\]\)]{1,40})[\]\)]\s*",
+        lambda m: f" {m.group(1)} " if DUP_SERIES_TOKEN_RE.search(m.group(1)) else " ",
+        raw,
+    )
+    raw = DUP_DROP_WORDS_RE.sub(" ", raw)
+    raw = re.sub(r"[._+\-]+", " ", raw)
+    raw = re.sub(r"[^a-z0-9\s]", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def duplicate_language_key(clean_name: str) -> str:
+    found = []
+    for match in DUP_LANG_RE.finditer(clean_name):
+        code = DUP_LANG_ALIASES.get(match.group(1).lower())
+        if code == "multi":
+            return "multi"
+        if code and code not in found:
+            found.append(code)
+    return "+".join(found) if found else "unknown"
+
+
+def duplicate_series_parts(clean_name: str):
+    match = DUP_SERIES_TOKEN_RE.search(clean_name)
+    if not match:
+        return None
+    gd = match.groupdict()
+    season = int(gd.get('s1') or gd.get('s2') or gd.get('s3') or gd.get('s4') or gd.get('s5') or 0)
+    episode = int(gd.get('e1') or gd.get('e2') or gd.get('e3') or gd.get('e4') or gd.get('e5') or 0)
+    before = clean_name[:match.start()].strip()
+    after = clean_name[match.end():].strip()
+    title = before if len(before) >= 3 else after
+    title = DUP_LANG_RE.sub(" ", title)
+    title = re.sub(r"\b(19|20)\d{2}\b", " ", title)
+    title = re.sub(r"\b(seasons?|episodes?|complete|all)\b", " ", title, flags=re.I)
+    title = re.sub(r"\s+", " ", title).strip()
+    return title, season, episode
+
+
+def duplicate_movie_title(clean_name: str):
+    title = DUP_SERIES_TOKEN_RE.sub(" ", clean_name)
+    title = DUP_LANG_RE.sub(" ", title)
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def duplicate_key_for_doc(doc):
+    clean_name = clean_duplicate_name(doc.get('file_name'))
+    lang = duplicate_language_key(clean_name)
+    series = duplicate_series_parts(clean_name)
+    if series:
+        title, season, episode = series
+        if not title:
+            title = duplicate_movie_title(clean_name)
+        return ("series", title, lang, season, episode)
+    return ("movie", duplicate_movie_title(clean_name), lang)
+
+
+def duplicate_sizes_match(left: int, right: int) -> bool:
+    if not left or not right:
+        return True
+    return abs(int(left) - int(right)) <= max(10 * 1024 * 1024, int(min(int(left), int(right)) * 0.02))
 SERIES_RE = re.compile(
     r'(?:\bS\d{1,2}\s*(?:E|EP|EPISODE)\s*\d{1,3}\b|\bSeason\s*\d{1,2}\b|\bEpisode\s*\d{1,3}\b|\bE(?:P)?\s*\d{1,3}\b)',
     re.IGNORECASE,
@@ -67,7 +179,7 @@ def is_bad_release_name(file_name):
 
 
 def is_series_name(file_name):
-    return bool(SERIES_RE.search(str(file_name or '')))
+    return bool(DUP_SERIES_TOKEN_RE.search(clean_duplicate_name(file_name)))
 
 
 def media_allowed_for_index(file_name, mode=None):
@@ -756,6 +868,47 @@ async def preload_media_cache(force=False):
         return len(_MEDIA_CACHE)
 
 
+async def _advanced_duplicate_exists(doc):
+    if not ADVANCED_DUPLICATE_SKIP:
+        return False
+    key = duplicate_key_for_doc(doc)
+    if not key or not key[1] or not int(doc.get('file_size') or 0):
+        return False
+
+    file_size = int(doc.get('file_size') or 0)
+    tolerance = max(10 * 1024 * 1024, int(file_size * 0.02))
+    min_size = max(1, file_size - tolerance)
+    max_size = file_size + tolerance
+    projection = {'file_name': 1, 'file_size': 1}
+
+    def _matches(candidate):
+        return (
+            candidate
+            and duplicate_sizes_match(file_size, int(candidate.get('file_size') or 0))
+            and duplicate_key_for_doc(candidate) == key
+        )
+
+    try:
+        if USE_MONGO:
+            query = {'file_size': {'$gte': min_size, '$lte': max_size}}
+            for col in _mongo_collections:
+                cursor = col.find(query, projection).batch_size(100)
+                async for candidate in cursor:
+                    if _matches(candidate):
+                        return True
+            return False
+
+        with store.begin() as conn:
+            rows = conn.execute(
+                text("SELECT file_id, file_name, file_size FROM media WHERE file_size BETWEEN :min_size AND :max_size"),
+                {"min_size": min_size, "max_size": max_size},
+            ).fetchall()
+        return any(_matches({'_id': row[0], 'file_name': row[1], 'file_size': row[2]}) for row in rows)
+    except Exception:
+        logger.exception('Advanced duplicate check failed; continuing normal save')
+        return False
+
+
 async def save_file(media):
     """Save file in database"""
 
@@ -778,6 +931,9 @@ async def save_file(media):
             'caption': media.caption.html if media.caption else None,
             'created_at': time.time(),
         }
+        if await _advanced_duplicate_exists(doc):
+            logger.warning('%s is already saved as an advanced duplicate', getattr(media, "file_name", "NO_FILE"))
+            return False, 0
         try:
             await _target_collection(file_id).insert_one(doc)
             _cache_doc(doc)
@@ -792,6 +948,20 @@ async def save_file(media):
             return False, 2
         logger.info(f'{getattr(media, "file_name", "NO_FILE")} is saved to database')
         return True, 1
+
+    doc = {
+        '_id': file_id,
+        'file_ref': file_ref,
+        'file_name': file_name,
+        'file_size': media.file_size,
+        'file_type': media.file_type,
+        'mime_type': media.mime_type,
+        'caption': media.caption.html if media.caption else None,
+        'created_at': time.time(),
+    }
+    if await _advanced_duplicate_exists(doc):
+        logger.warning('%s is already saved as an advanced duplicate', getattr(media, "file_name", "NO_FILE"))
+        return False, 0
 
     with store.begin() as conn:
         exists = conn.execute(text("SELECT 1 FROM media WHERE file_id=:fid"), {"fid": file_id}).first()
@@ -812,16 +982,6 @@ async def save_file(media):
                 "caption": media.caption.html if media.caption else None,
             },
         )
-    doc = {
-        '_id': file_id,
-        'file_ref': file_ref,
-        'file_name': file_name,
-        'file_size': media.file_size,
-        'file_type': media.file_type,
-        'mime_type': media.mime_type,
-        'caption': media.caption.html if media.caption else None,
-        'created_at': time.time(),
-    }
     _cache_doc(doc)
     if _disk_cache_enabled() and _DISK_CACHE_READY:
         await asyncio.to_thread(_disk_upsert_many_sync, [doc])
