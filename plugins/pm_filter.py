@@ -36,6 +36,7 @@ BUTTONS = {}
 MONGO_DB_CAP_BYTES = 536870912
 MONGO_DB_COUNT = len([u for u in (DATABASE_URI, DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5) if u])
 SPELL_CHECK = {}
+WARN_COUNTS = {}
 
 
 START_PAYLOAD_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -60,6 +61,91 @@ async def _answer_url_or_alert(query, url, alert="Open the bot PM and try again.
         return await query.answer(alert, show_alert=True)
 
 
+
+URL_RE = re.compile(r"(?:https?://|www\.|t\.me/|telegram\.(?:me|dog)/|\b[a-z0-9-]+\.(?:com|net|org|in|io|me|co|tv|link)\b)", re.I)
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U00002300-\U000023FF"
+    "]",
+    re.UNICODE,
+)
+
+
+def _is_owner_admin(user):
+    if not user:
+        return False
+    if user.id in ADMINS:
+        return True
+    return bool(user.username and f"@{user.username}" in ADMINS)
+
+
+def _message_violation_reason(text: str):
+    if len(text) > 255:
+        return "message is longer than 255 characters"
+    if URL_RE.search(text):
+        return "message contains a URL"
+    if EMOJI_RE.search(text):
+        return "message contains emoji"
+    return None
+
+
+async def _handle_group_message_policy(client, message):
+    if message.chat.type not in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP):
+        return False
+    if not message.text or not message.from_user or _is_owner_admin(message.from_user):
+        return False
+
+    reason = _message_violation_reason(message.text)
+    if not reason:
+        return False
+
+    try:
+        member = await client.get_chat_member(message.chat.id, message.from_user.id)
+        if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
+            return False
+    except Exception:
+        pass
+
+    key = (message.chat.id, message.from_user.id)
+    WARN_COUNTS[key] = WARN_COUNTS.get(key, 0) + 1
+    warns = WARN_COUNTS[key]
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    mention = message.from_user.mention
+    if warns >= 4:
+        try:
+            await client.ban_chat_member(message.chat.id, message.from_user.id)
+            WARN_COUNTS.pop(key, None)
+            notice = await client.send_message(
+                message.chat.id,
+                f"🚫 {mention} banned from this group.\nReason: {reason}.\nViolations: 4/4"
+            )
+        except Exception as e:
+            logger.exception(e)
+            notice = await client.send_message(
+                message.chat.id,
+                f"⚠️ {mention} reached 4/4 violations for {reason}, but I could not ban them."
+            )
+    else:
+        notice = await client.send_message(
+            message.chat.id,
+            f"⚠️ Warning {warns}/3 for {mention}.\nReason: {reason}.\nYou will be banned on the 4th violation."
+        )
+
+    await asyncio.sleep(10)
+    try:
+        await notice.delete()
+    except Exception:
+        pass
+    return True
+
 def _looks_like_series_request(text: str) -> bool:
     raw = str(text or '').lower()
     if is_series_name(raw):
@@ -82,6 +168,9 @@ def _format_search_time(seconds):
 
 @Client.on_message(filters.group | filters.private & filters.text & filters.incoming) 
 async def give_filter(client, message):
+    if await _handle_group_message_policy(client, message):
+        return
+
     try:
         await message.delete()
     except Exception:
