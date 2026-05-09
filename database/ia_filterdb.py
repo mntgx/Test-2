@@ -16,7 +16,7 @@ from sqlalchemy import text
 from info import (
     DATABASE_URI, DATABASE_NAME, COLLECTION_NAME, USE_CAPTION_FILTER,
     DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5,
-    DATABASE_NAME2, DATABASE_NAME3, DATABASE_NAME4, DATABASE_NAME5,
+    DATABASE_NAME2, DATABASE_NAME3, DATABASE_NAME4, DATABASE_NAME5, INDEX_MODE,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,69 @@ logger.setLevel(logging.INFO)
 SEARCH_CACHE_TTL = 30
 SEARCH_CACHE_MAX = 256
 _SEARCH_CACHE = OrderedDict()
+
+BAD_RELEASE_TAGS = (
+    'predvdrip', 'camrip', 'hdts', 'prehd', 'dvdscr', 'hq real',
+)
+SERIES_RE = re.compile(
+    r'(?:\bS\d{1,2}\s*(?:E|EP|EPISODE)\s*\d{1,3}\b|\bSeason\s*\d{1,2}\b|\bEpisode\s*\d{1,3}\b|\bE(?:P)?\s*\d{1,3}\b)',
+    re.IGNORECASE,
+)
+VALID_INDEX_MODES = {'both', 'series', 'movies'}
+_ACTIVE_INDEX_MODE = INDEX_MODE if INDEX_MODE in VALID_INDEX_MODES else 'both'
+_MEDIA_CACHE = OrderedDict()
+_MEDIA_CACHE_READY = False
+_MEDIA_CACHE_LOCK = asyncio.Lock()
+
+
+def normalize_index_mode(value):
+    mode = str(value or 'both').strip().lower()
+    return mode if mode in VALID_INDEX_MODES else 'both'
+
+
+def set_index_mode(value):
+    global _ACTIVE_INDEX_MODE
+    _ACTIVE_INDEX_MODE = normalize_index_mode(value)
+    return _ACTIVE_INDEX_MODE
+
+
+def get_index_mode():
+    return _ACTIVE_INDEX_MODE
+
+
+def is_bad_release_name(file_name):
+    normalized = re.sub(r'[_\-.+]+', ' ', str(file_name or '')).lower()
+    return any(tag in normalized for tag in BAD_RELEASE_TAGS)
+
+
+def is_series_name(file_name):
+    return bool(SERIES_RE.search(str(file_name or '')))
+
+
+def media_allowed_for_index(file_name, mode=None):
+    if is_bad_release_name(file_name):
+        return False, 'bad_release'
+    mode = normalize_index_mode(mode or _ACTIVE_INDEX_MODE)
+    series = is_series_name(file_name)
+    if mode == 'series' and not series:
+        return False, 'movie_in_series_mode'
+    if mode == 'movies' and series:
+        return False, 'series_in_movies_mode'
+    return True, None
+
+
+def _cache_doc(doc):
+    if not doc:
+        return
+    d = _as_media_doc(doc)
+    fid = d.get('_id') or d.get('file_id')
+    if fid:
+        _MEDIA_CACHE[fid] = d
+
+
+def _uncache_doc(file_id):
+    _MEDIA_CACHE.pop(file_id, None)
+
 
 
 def _cache_get(key):
@@ -184,6 +247,8 @@ class SQLMediaCollection:
         with store.begin() as conn:
             for fid in ids:
                 conn.execute(text("DELETE FROM media WHERE file_id=:fid"), {"fid": fid})
+        for fid in ids:
+            _uncache_doc(fid)
         _SEARCH_CACHE.clear()
         return SQLDeleteResult(len(ids))
 
@@ -194,12 +259,14 @@ class SQLMediaCollection:
         fid = docs[0]['file_id']
         with store.begin() as conn:
             conn.execute(text("DELETE FROM media WHERE file_id=:fid"), {"fid": fid})
+        _uncache_doc(fid)
         _SEARCH_CACHE.clear()
         return SQLDeleteResult(1)
 
     async def drop(self):
         with store.begin() as conn:
             conn.execute(text("DELETE FROM media"))
+        _MEDIA_CACHE.clear()
         _SEARCH_CACHE.clear()
 
 
@@ -302,6 +369,7 @@ if USE_MONGO:
             results = await asyncio.gather(*[col.delete_many(query) for col in _mongo_collections])
             deleted_count = sum(r.deleted_count for r in results)
             if deleted_count:
+                await preload_media_cache(force=True)
                 _SEARCH_CACHE.clear()
             return SQLDeleteResult(deleted_count)
 
@@ -313,11 +381,13 @@ if USE_MONGO:
                 res = await col.delete_one(query)
                 deleted += res.deleted_count
             if deleted:
+                await preload_media_cache(force=True)
                 _SEARCH_CACHE.clear()
             return SQLDeleteResult(deleted)
 
         async def drop(self):
             await asyncio.gather(*[col.drop() for col in _mongo_collections])
+            _MEDIA_CACHE.clear()
             _SEARCH_CACHE.clear()
 
     class Media:
@@ -346,6 +416,8 @@ if USE_MONGO:
         @staticmethod
         async def count_documents(query=None):
             q = query or {}
+            if _MEDIA_CACHE_READY:
+                return sum(1 for doc in _MEDIA_CACHE.values() if _match_filter(doc, q))
             if MONGO_SHARD_COUNT == 1:
                 return await _mongo_collections[0].count_documents(q)
             counts = await asyncio.gather(*[col.count_documents(q) for col in _mongo_collections])
@@ -386,12 +458,53 @@ else:
             return SQLCursor(_load_docs_sync(query))
 
 
+async def preload_media_cache(force=False):
+    """Load all indexed media into process memory after deploy/restart."""
+    global _MEDIA_CACHE_READY
+    if _MEDIA_CACHE_READY and not force:
+        return len(_MEDIA_CACHE)
+    async with _MEDIA_CACHE_LOCK:
+        if _MEDIA_CACHE_READY and not force:
+            return len(_MEDIA_CACHE)
+        docs = OrderedDict()
+        if USE_MONGO:
+            projection = {
+                'file_ref': 1, 'file_name': 1, 'file_size': 1, 'file_type': 1,
+                'mime_type': 1, 'caption': 1, 'created_at': 1,
+            }
+            async def _load(col):
+                return await col.find({}, projection).sort('created_at', -1).to_list(length=None)
+            parts = await asyncio.gather(*[_load(col) for col in _mongo_collections])
+            for part in parts:
+                for doc in part:
+                    d = _as_media_doc(doc)
+                    fid = d.get('_id') or d.get('file_id')
+                    if fid:
+                        docs[fid] = d
+        else:
+            for doc in _load_docs_sync({}):
+                d = _as_media_doc(doc)
+                fid = d.get('_id') or d.get('file_id')
+                if fid:
+                    docs[fid] = d
+        _MEDIA_CACHE.clear()
+        _MEDIA_CACHE.update(docs)
+        _MEDIA_CACHE_READY = True
+        _SEARCH_CACHE.clear()
+        logger.info('Preloaded %d media records into local runtime cache', len(_MEDIA_CACHE))
+        return len(_MEDIA_CACHE)
+
+
 async def save_file(media):
     """Save file in database"""
 
     # TODO: Find better way to get same file_id for same media to avoid duplicates
     file_id, file_ref = unpack_new_file_id(media.file_id)
     file_name = re.sub(r"(_|\-|\.|\+)", " ", str(media.file_name))
+    allowed, reason = media_allowed_for_index(file_name)
+    if not allowed:
+        logger.info('Skipping %s due to index policy: %s', getattr(media, 'file_name', 'NO_FILE'), reason)
+        return False, 3
 
     if USE_MONGO:
         doc = {
@@ -406,6 +519,7 @@ async def save_file(media):
         }
         try:
             await _target_collection(file_id).insert_one(doc)
+            _cache_doc(doc)
             _SEARCH_CACHE.clear()
         except DuplicateKeyError:
             logger.warning(f'{getattr(media, "file_name", "NO_FILE")} is already saved in database')
@@ -435,6 +549,16 @@ async def save_file(media):
                 "caption": media.caption.html if media.caption else None,
             },
         )
+    _cache_doc({
+        '_id': file_id,
+        'file_ref': file_ref,
+        'file_name': file_name,
+        'file_size': media.file_size,
+        'file_type': media.file_type,
+        'mime_type': media.mime_type,
+        'caption': media.caption.html if media.caption else None,
+        'created_at': time.time(),
+    })
     _SEARCH_CACHE.clear()
     return True, 1
 
@@ -609,6 +733,25 @@ async def get_search_results(
         'caption': 1,
         'created_at': 1,
     }
+
+    if _MEDIA_CACHE_READY:
+        matched = [d for d in _MEDIA_CACHE.values() if _match_filter(d, search_filter)]
+        matched.sort(key=lambda d: d.get('created_at', 0), reverse=True)
+        page = matched[offset: offset + max_results + (1 if fast else 0)]
+        has_more = fast and len(page) > max_results
+        files = [_as_media_doc(d) for d in page[:max_results]]
+        next_offset = offset + max_results
+        if fast:
+            total_results = offset + len(files) + (1 if has_more else 0)
+            if not has_more:
+                next_offset = ''
+        else:
+            total_results = len(matched)
+            if next_offset >= total_results:
+                next_offset = ''
+        result = (files, next_offset, total_results)
+        _cache_set(cache_key, result)
+        return _finish_search(*result, started_at, return_time)
 
     if MONGO_SHARD_COUNT == 1:
         col = _mongo_collections[0]

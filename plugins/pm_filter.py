@@ -12,7 +12,7 @@ from database.connections_mdb import active_connection, all_connections, delete_
 from info import (
     ADMINS, AUTH_USERS, CUSTOM_FILE_CAPTION, AUTH_GROUPS, P_TTI_SHOW_OFF, IMDB,
     SINGLE_BUTTON, SPELL_CHECK_REPLY, IMDB_TEMPLATE, DATABASE_URI, DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5,
-    POSTGRES_STORAGE_LIMIT_BYTES,
+    POSTGRES_STORAGE_LIMIT_BYTES, MOVIES_REQUEST_GROUP, SERIES_REQUEST_GROUP,
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram import Client, filters, enums
@@ -20,7 +20,7 @@ from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerId
 from utils import get_size, is_subscribed, get_poster, search_gagala, temp, get_settings, save_group_settings, create_invite_links
 from database.users_chats_db import db
 from info import HYPER_MODE
-from database.ia_filterdb import Media, get_file_details, get_search_results
+from database.ia_filterdb import Media, get_file_details, get_search_results, get_index_mode, is_series_name
 from database.filters_mdb import (
     del_all,
     find_filter,
@@ -35,6 +35,22 @@ BUTTONS = {}
 MONGO_DB_CAP_BYTES = 536870912
 MONGO_DB_COUNT = len([u for u in (DATABASE_URI, DATABASE_URI2, DATABASE_URI3, DATABASE_URI4, DATABASE_URI5) if u])
 SPELL_CHECK = {}
+
+
+def _looks_like_series_request(text: str) -> bool:
+    raw = str(text or '').lower()
+    if is_series_name(raw):
+        return True
+    return bool(re.search(r"\b(series|season|episode|episodes|web\s*series)\b", raw, re.I))
+
+
+def _index_mode_redirect_message(text: str):
+    mode = get_index_mode()
+    if mode == 'series' and not _looks_like_series_request(text):
+        return f"ask movies in {MOVIES_REQUEST_GROUP}"
+    if mode == 'movies' and _looks_like_series_request(text):
+        return f"ask series in {SERIES_REQUEST_GROUP}"
+    return None
 
 
 def _format_search_time(seconds):
@@ -732,6 +748,11 @@ async def auto_filter(client, msg, spoll=False):
         if re.findall(r"((^\/|^,|^!|^\.|^[\U0001F600-\U000E007F]).*)", message.text):
             return
         if 2 < len(message.text) < 100:
+            redirect = _index_mode_redirect_message(message.text) if message.chat.type == enums.ChatType.PRIVATE else None
+            if redirect:
+                note = await message.reply_text(redirect)
+                await asyncio.sleep(20)
+                return await note.delete()
             search = message.text
             files, offset, total_results, search_time = await get_search_results(
                 search.lower(), offset=0, filter=True, fast=True, return_time=True

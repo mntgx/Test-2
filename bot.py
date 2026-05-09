@@ -20,7 +20,7 @@ import tgcrypto
 from pyrogram import Client, __version__
 from pyrogram.types import BotCommand
 from pyrogram.raw.all import layer
-from database.ia_filterdb import Media
+from database.ia_filterdb import Media, preload_media_cache, set_index_mode
 from database.users_chats_db import db
 from info import SESSION, API_ID, API_HASH, BOT_TOKEN, LOG_STR, LOG_CHANNEL, KEEP_ALIVE_URL, DEFAULT_AUTH_CHANNELS
 from utils import temp
@@ -36,7 +36,7 @@ pyroutils.MIN_CHAT_ID = -999999999999
 pyroutils.MIN_CHANNEL_ID = -100999999999999
 
 from plugins.webcode import bot_run
-from plugins.new_updates import run_daily_summary
+from plugins.new_updates import load_runtime_update_config, run_daily_summary
 
 PORT_CODE = environ.get("PORT", "8080")
 
@@ -106,6 +106,11 @@ class Bot(Client):
         temp.BANNED_CHATS = b_chats
         await super().start()
         await asyncio.gather(Media.ensure_indexes(), db.ensure_indexes())
+        await load_runtime_update_config()
+        saved_index_mode = await db.get_config_value('index_mode', None)
+        if saved_index_mode:
+            set_index_mode(saved_index_mode)
+        await preload_media_cache()
         me = await self.get_me()
         temp.ME = me.id
         temp.U_NAME = me.username

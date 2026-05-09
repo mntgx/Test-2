@@ -255,6 +255,26 @@ class Database:
 
         return AsyncRows()
 
+
+    async def set_config_value(self, key: str, value):
+        if self.use_mongo:
+            await self.config.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
+            return
+        with store.begin() as conn:
+            exists = conn.execute(text("SELECT 1 FROM config_data WHERE key_name=:key"), {"key": key}).first()
+            if exists:
+                conn.execute(text("UPDATE config_data SET value_json=:value WHERE key_name=:key"), {"key": key, "value": store.to_json(value)})
+            else:
+                conn.execute(text("INSERT INTO config_data(key_name, value_json) VALUES (:key, :value)"), {"key": key, "value": store.to_json(value)})
+
+    async def get_config_value(self, key: str, default=None):
+        if self.use_mongo:
+            doc = await self.config.find_one({"_id": key})
+            return doc.get("value", default) if doc else default
+        with store.begin() as conn:
+            row = conn.execute(text("SELECT value_json FROM config_data WHERE key_name=:key"), {"key": key})
+            return store.from_json(row.scalar(), default)
+
     async def set_auth_channels(self, channels: list[int]):
         if self.use_mongo:
             await self.config.update_one({"_id": "auth_channels"}, {"$set": {"channels": channels}}, upsert=True)
