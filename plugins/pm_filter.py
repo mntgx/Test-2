@@ -17,7 +17,7 @@ from info import (
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait, UserIsBlocked, MessageNotModified, PeerIdInvalid
+from pyrogram.errors import FloodWait, QueryIdInvalid, UserIsBlocked, MessageNotModified, PeerIdInvalid
 from utils import get_size, is_subscribed, get_poster, search_gagala, temp, get_settings, save_group_settings, create_invite_links
 from database.users_chats_db import db
 from info import HYPER_MODE
@@ -52,13 +52,25 @@ def _bot_start_url(payload=None):
     return base
 
 
-async def _answer_url_or_alert(query, url, alert="Open the bot PM and try again."):
-    if not url:
-        return await query.answer(alert, show_alert=True)
+async def _safe_query_answer(query, *args, **kwargs):
     try:
-        return await query.answer(url=url)
+        return await query.answer(*args, **kwargs)
+    except QueryIdInvalid:
+        return None
     except Exception:
-        return await query.answer(alert, show_alert=True)
+        logger.exception("Failed to answer callback query")
+        return None
+
+
+async def _answer_url_or_alert(query, url, alert="Open the bot PM and try again."):
+    if url:
+        try:
+            return await query.answer(url=url)
+        except QueryIdInvalid:
+            return None
+        except Exception:
+            logger.warning("Callback URL answer failed; falling back to alert", exc_info=True)
+    return await _safe_query_answer(query, alert, show_alert=True)
 
 
 
@@ -530,7 +542,7 @@ async def cb_handler(client: Client, query: CallbackQuery):
                 return
             await _answer_url_or_alert(query, pm_url, "Open the bot PM and try again.")
         except UserIsBlocked:
-            await query.answer('Unblock the bot mahn !', show_alert=True)
+            await _safe_query_answer(query, 'Unblock the bot mahn !', show_alert=True)
         except PeerIdInvalid:
             await _answer_url_or_alert(query, pm_url, "Start the bot PM first, then try again.")
         except Exception as e:
