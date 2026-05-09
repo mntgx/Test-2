@@ -539,14 +539,18 @@ if USE_MONGO:
             return MongoUnionCursor(query=query, projection=projection)
 
         async def delete_many(self, query):
+            global _MEDIA_CACHE_COMPLETE, _DISK_CACHE_COMPLETE
             results = await asyncio.gather(*[col.delete_many(query) for col in _mongo_collections])
             deleted_count = sum(r.deleted_count for r in results)
             if deleted_count:
-                await preload_media_cache(force=True)
+                _MEDIA_CACHE.clear()
+                _MEDIA_CACHE_COMPLETE = False
+                _DISK_CACHE_COMPLETE = False
                 _SEARCH_CACHE.clear()
             return SQLDeleteResult(deleted_count)
 
         async def delete_one(self, query):
+            global _MEDIA_CACHE_COMPLETE, _DISK_CACHE_COMPLETE
             deleted = 0
             for col in _mongo_collections:
                 if deleted:
@@ -554,7 +558,9 @@ if USE_MONGO:
                 res = await col.delete_one(query)
                 deleted += res.deleted_count
             if deleted:
-                await preload_media_cache(force=True)
+                _MEDIA_CACHE.clear()
+                _MEDIA_CACHE_COMPLETE = False
+                _DISK_CACHE_COMPLETE = False
                 _SEARCH_CACHE.clear()
             return SQLDeleteResult(deleted)
 

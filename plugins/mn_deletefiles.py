@@ -456,11 +456,17 @@ async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
 
     if shard_ops and USE_MONGO:
         import database.ia_filterdb as media_db
+        shard_batches = {}
         for _, col_idx, file_id in shard_ops:
-            result = await media_db._mongo_collections[col_idx].delete_one({'_id': file_id})
-            deleted += result.deleted_count
-            await _delete_progress()
-            await asyncio.sleep(0)
+            shard_batches.setdefault(col_idx, []).append(file_id)
+        for col_idx, file_ids in shard_batches.items():
+            col = media_db._mongo_collections[col_idx]
+            for start in range(0, len(file_ids), DUP_BATCH_DELETE):
+                batch = file_ids[start:start + DUP_BATCH_DELETE]
+                result = await col.delete_many({'_id': {'$in': batch}})
+                deleted += result.deleted_count
+                await _delete_progress()
+                await asyncio.sleep(0.1)
 
     await _safe_edit_duplicate_status(
         query.message,
