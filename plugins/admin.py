@@ -3,6 +3,7 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from info import ADMINS
 from database.users_chats_db import db
+from database.ia_filterdb import get_index_mode, set_index_mode
 import plugins.new_updates as nu
 from plugins.commands import build_fsub_details_text
 
@@ -20,7 +21,8 @@ def _updates_text():
         f"GETDLINK_PAGE_SIZE: <code>{cfg['GETDLINK_PAGE_SIZE']}</code>\n"
         f"GROUP_SIZE: <code>{cfg['GROUP_SIZE']}</code>\n"
         f"CHANNEL_SEND_MODE: <code>{cfg['CHANNEL_SEND_MODE']}</code>\n"
-        f"GROUP_SEARCH_TEXT: <code>{cfg['GROUP_SEARCH_TEXT']}</code>"
+        f"GROUP_SEARCH_TEXT: <code>{cfg['GROUP_SEARCH_TEXT']}</code>\n"
+        f"INDEX_MODE: <code>{get_index_mode()}</code>"
     )
 
 
@@ -29,7 +31,8 @@ def _updates_markup():
         [InlineKeyboardButton("Movie Channels", callback_data="admin:upd:channels"), InlineKeyboardButton("Set New Chat", callback_data="admin:upd:setchat")],
         [InlineKeyboardButton("Mode", callback_data="admin:upd:mode"), InlineKeyboardButton("Group Size", callback_data="admin:upd:gsize")],
         [InlineKeyboardButton("Page Size", callback_data="admin:upd:psize"), InlineKeyboardButton("Send Delay", callback_data="admin:upd:sdelay")],
-        [InlineKeyboardButton("GetDLink Size", callback_data="admin:upd:dlsize"), InlineKeyboardButton("Refresh", callback_data="admin:updates")],
+        [InlineKeyboardButton("GetDLink Size", callback_data="admin:upd:dlsize"), InlineKeyboardButton("Index Mode", callback_data="admin:upd:indexmode")],
+        [InlineKeyboardButton("Refresh", callback_data="admin:updates")],
         [InlineKeyboardButton("Back", callback_data="admin:back")],
     ])
 
@@ -120,6 +123,7 @@ async def admin_upd_mode(client, query):
 async def admin_setmode(client, query):
     mode = query.matches[0].group(1)
     nu.set_runtime_update_config("CHANNEL_SEND_MODE", mode)
+    await nu.persist_runtime_update_config()
     await query.answer(f"Mode set to {mode}")
     await query.message.edit_text(_updates_text(), reply_markup=_updates_markup())
 
@@ -137,5 +141,23 @@ async def admin_num_apply(client, query):
     elif key=="psize": nu.set_runtime_update_config("PAGE_SIZE", cfg["PAGE_SIZE"] + delta)
     elif key=="dlsize": nu.set_runtime_update_config("GETDLINK_PAGE_SIZE", cfg["GETDLINK_PAGE_SIZE"] + delta)
     elif key=="sdelay": nu.set_runtime_update_config("SEND_DELAY", round(cfg["SEND_DELAY"] + (0.1*delta), 2))
+    await nu.persist_runtime_update_config()
     await query.answer("Updated")
+    await query.message.edit_text(_updates_text(), reply_markup=_updates_markup())
+
+
+@Client.on_callback_query(filters.regex(r"^admin:upd:indexmode$"))
+async def admin_upd_indexmode(client, query):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Both", callback_data="admin:setindexmode:both"), InlineKeyboardButton("Series", callback_data="admin:setindexmode:series"), InlineKeyboardButton("Movies", callback_data="admin:setindexmode:movies")],
+        [InlineKeyboardButton("Back", callback_data="admin:updates")],
+    ])
+    await query.message.edit_text("Choose indexing mode:\n\nBoth = save movies and series\nSeries = save only series\nMovies = save only movies", reply_markup=kb)
+
+@Client.on_callback_query(filters.regex(r"^admin:setindexmode:(both|series|movies)$"))
+async def admin_setindexmode(client, query):
+    mode = query.matches[0].group(1)
+    set_index_mode(mode)
+    await db.set_config_value("index_mode", mode)
+    await query.answer(f"Index mode set to {mode}")
     await query.message.edit_text(_updates_text(), reply_markup=_updates_markup())

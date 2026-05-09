@@ -82,6 +82,14 @@ FILE_CHANNELS = [int(ch) for ch in environ.get('FILE_CHANNELS', '-1002539291881 
 FILE_CHANNEL_SENDING_MODE = is_enabled(environ.get('FILE_CHANNEL_SENDING_MODE', 'True'), False)
 FILE_AUTO_DELETE_SECONDS = int(environ.get('FILE_AUTO_DELETE_SECONDS', 60))  # Default: 1 minute
 
+# Indexing / request routing
+INDEX_MODE = environ.get('INDEX_MODE', 'both').strip().lower()
+MEDIA_CACHE_MAX = int(environ.get('MEDIA_CACHE_MAX', 5000))
+DISK_MEDIA_CACHE = is_enabled(environ.get('DISK_MEDIA_CACHE', 'True'), False)
+DISK_MEDIA_CACHE_PATH = environ.get('DISK_MEDIA_CACHE_PATH', '/tmp/media_cache.sqlite3')
+MOVIES_REQUEST_GROUP = environ.get('MOVIES_REQUEST_GROUP', '@malayalam_2022')
+SERIES_REQUEST_GROUP = environ.get('SERIES_REQUEST_GROUP', '@seriesgroup')
+
 # Others
 LOG_CHANNEL = int(environ.get('LOG_CHANNEL', '-1003787970644'))
 SUPPORT_CHAT = environ.get('SUPPORT_CHAT', 'mnbots_support')
