@@ -169,6 +169,7 @@ async def close_message(bot: Client, query: CallbackQuery):
 
 # ─── duplicate cleanup ───────────────────────────────────────────────────────
 DUP_SCAN_CACHE = {}
+DUP_SCAN_LOCK = asyncio.Lock()
 DUP_BATCH_DELETE = 500
 DUP_PROGRESS_EVERY = 30
 LANG_ALIASES = {
@@ -359,9 +360,9 @@ async def _scan_duplicate_ops(status=None):
         else:
             seen_ids[fid] = item
             duplicate_sets += _add_duplicate_candidate(item, groups, duplicate_ops, duplicate_seen)
-        if checked % 1000 == 0:
+        if checked % 100 == 0:
             await _progress()
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
 
     if USE_MONGO:
         import database.ia_filterdb as media_db
@@ -392,8 +393,12 @@ async def delete_duplicate_files(bot: Client, message: Message):
     if message.chat.type != enums.ChatType.PRIVATE:
         return await message.reply_text("<b>This command only works in my PM.</b>", parse_mode=enums.ParseMode.HTML)
 
+    if DUP_SCAN_LOCK.locked():
+        return await message.reply_text("⚠️ Duplicate cleanup is already running. Please wait until it finishes.")
+
     status = await message.reply_text("🔍 Scanning DB for duplicate files...", quote=True)
-    checked, duplicate_ops, duplicate_sets = await _scan_duplicate_ops(status)
+    async with DUP_SCAN_LOCK:
+        checked, duplicate_ops, duplicate_sets = await _scan_duplicate_ops(status)
 
     if not duplicate_ops:
         return await _safe_edit_duplicate_status(status, f"✅ Scan complete. Checked <code>{checked}</code> files. No duplicates found.")

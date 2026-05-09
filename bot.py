@@ -18,14 +18,28 @@ logging.getLogger("asyncio").setLevel(logging.CRITICAL - 1)
 
 import tgcrypto
 from pyrogram import Client, __version__
-from pyrogram.types import BotCommand
+from pyrogram.types import BotCommand, CallbackQuery
 from pyrogram.raw.all import layer
+from pyrogram.errors import QueryIdInvalid
 from database.ia_filterdb import Media, preload_media_cache, set_index_mode
 from database.users_chats_db import db
 from info import SESSION, API_ID, API_HASH, BOT_TOKEN, LOG_STR, LOG_CHANNEL, KEEP_ALIVE_URL, DEFAULT_AUTH_CHANNELS
 from utils import temp
 from typing import Union, Optional, AsyncGenerator
 from pyrogram import types
+
+_ORIGINAL_CALLBACK_ANSWER = CallbackQuery.answer
+
+
+async def _safe_callback_answer(self, *args, **kwargs):
+    try:
+        return await _ORIGINAL_CALLBACK_ANSWER(self, *args, **kwargs)
+    except QueryIdInvalid:
+        logging.debug("Ignoring expired callback query answer")
+        return None
+
+
+CallbackQuery.answer = _safe_callback_answer
 from Script import script
 from os import environ
 from aiohttp import web as webserver
