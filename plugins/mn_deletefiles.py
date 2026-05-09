@@ -165,3 +165,224 @@ async def confirm_and_delete_files_by_keyword(bot: Client, query: CallbackQuery)
 async def close_message(bot: Client, query: CallbackQuery):
     await query.answer()
     await query.message.delete()
+
+# ─── duplicate cleanup ───────────────────────────────────────────────────────
+DUP_SCAN_CACHE = {}
+DUP_BATCH_DELETE = 500
+LANG_ALIASES = {
+    "malayalam": "mal", "mal": "mal", "ml": "mal",
+    "tamil": "tam", "tam": "tam", "ta": "tam",
+    "hindi": "hin", "hin": "hin", "hi": "hin",
+    "english": "eng", "eng": "eng", "en": "eng",
+    "telugu": "tel", "tel": "tel", "te": "tel",
+    "kannada": "kan", "kan": "kan", "kn": "kan",
+}
+LANG_RE = re.compile(r"\b(" + "|".join(map(re.escape, sorted(LANG_ALIASES, key=len, reverse=True))) + r")\b", re.I)
+SERIES_TOKEN_RE = re.compile(
+    r"(?:\bS(?P<s1>\d{1,2})\s*E(?P<e1>\d{1,3})\b|\bSeason\s*(?P<s2>\d{1,2}).*?\b(?:Episode|Ep|E)\s*(?P<e2>\d{1,3})\b)",
+    re.I,
+)
+DROP_WORDS_RE = re.compile(
+    r"\b(\d{3,4}p|4k|x264|x265|hevc|h\.?264|h\.?265|aac|ddp?\d?\.\d|web[- ]?dl|webrip|hdrip|bluray|brrip|dvdrip|proper|repack|esub|multi|org|original|uncut)\b",
+    re.I,
+)
+
+
+def _clean_dup_name(name: str) -> str:
+    raw = str(name or "").lower()
+    raw = re.sub(r"\.[a-z0-9]{2,4}$", " ", raw)
+    raw = re.sub(r"@\w+", " ", raw)
+    raw = re.sub(r"https?://\S+|www\.\S+", " ", raw)
+    raw = re.sub(
+        r"^[\[\(]([^\]\)]{1,25})[\]\)]\s*",
+        lambda m: f" {m.group(1)} " if SERIES_TOKEN_RE.search(m.group(1)) else " ",
+        raw,
+    )
+    raw = DROP_WORDS_RE.sub(" ", raw)
+    raw = re.sub(r"[._+\-]+", " ", raw)
+    raw = re.sub(r"[^a-z0-9\s]", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _detect_lang(clean_name: str) -> str:
+    found = []
+    for match in LANG_RE.finditer(clean_name):
+        code = LANG_ALIASES.get(match.group(1).lower())
+        if code and code not in found:
+            found.append(code)
+    return "+".join(found) if found else "unknown"
+
+
+def _series_parts(clean_name: str):
+    match = SERIES_TOKEN_RE.search(clean_name)
+    if not match:
+        return None
+    season = int(match.group('s1') or match.group('s2') or 0)
+    episode = int(match.group('e1') or match.group('e2') or 0)
+    before = clean_name[:match.start()].strip()
+    after = clean_name[match.end():].strip()
+    title = before if len(before) >= 3 else after
+    title = LANG_RE.sub(" ", title)
+    title = re.sub(r"\b(19|20)\d{2}\b", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    return title, season, episode
+
+
+def _movie_title(clean_name: str):
+    title = SERIES_TOKEN_RE.sub(" ", clean_name)
+    title = LANG_RE.sub(" ", title)
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def _duplicate_key(doc):
+    clean_name = _clean_dup_name(doc.get('file_name'))
+    lang = _detect_lang(clean_name)
+    series = _series_parts(clean_name)
+    if series:
+        title, season, episode = series
+        if not title:
+            title = _movie_title(clean_name)
+        return ("series", title, lang, season, episode)
+    return ("movie", _movie_title(clean_name), lang)
+
+
+def _same_size(left: int, right: int) -> bool:
+    if not left or not right:
+        return True
+    return abs(int(left) - int(right)) <= max(10 * 1024 * 1024, int(min(int(left), int(right)) * 0.02))
+
+
+def _pick_keeper(docs):
+    return max(docs, key=lambda d: (int(d.get('file_size') or 0), float(d.get('created_at') or 0)))
+
+
+async def _load_duplicate_candidates():
+    candidates = []
+    seen_ids = {}
+    id_dupes = []
+
+    def _add_doc(doc):
+        fid = doc.get('_id') or doc.get('file_id')
+        if not fid:
+            return
+        item = {
+            '_id': fid,
+            'file_name': doc.get('file_name') or '',
+            'file_size': int(doc.get('file_size') or 0),
+            'created_at': float(doc.get('created_at') or 0),
+        }
+        if fid in seen_ids:
+            id_dupes.append(item)
+        else:
+            seen_ids[fid] = item
+            candidates.append(item)
+
+    if USE_MONGO:
+        import database.ia_filterdb as media_db
+        projection = {'file_name': 1, 'file_size': 1, 'created_at': 1}
+        for col in media_db._mongo_collections:
+            cursor = col.find({}, projection).batch_size(1000)
+            async for doc in cursor:
+                _add_doc(doc)
+    else:
+        from database.sql_store import store
+        from sqlalchemy import text as sa_text
+
+        with store.begin() as conn:
+            rows = conn.execute(
+                sa_text("SELECT file_id, file_name, file_size, created_at FROM media")
+            ).fetchall()
+        for row in rows:
+            _add_doc({'_id': row[0], 'file_name': row[1], 'file_size': row[2], 'created_at': row[3]})
+
+    return candidates, id_dupes
+
+
+def _find_duplicate_ids(candidates, id_dupes):
+    groups = {}
+    for doc in candidates:
+        key = _duplicate_key(doc)
+        if not key or not key[1]:
+            continue
+        groups.setdefault(key, []).append(doc)
+
+    duplicate_ids = {doc['_id'] for doc in id_dupes}
+    duplicate_sets = 0
+    for docs in groups.values():
+        if len(docs) < 2:
+            continue
+        buckets = []
+        for doc in sorted(docs, key=lambda d: int(d.get('file_size') or 0)):
+            for bucket in buckets:
+                if _same_size(doc.get('file_size'), bucket[0].get('file_size')):
+                    bucket.append(doc)
+                    break
+            else:
+                buckets.append([doc])
+        for bucket in buckets:
+            if len(bucket) < 2:
+                continue
+            keeper = _pick_keeper(bucket)
+            remove = [doc['_id'] for doc in bucket if doc['_id'] != keeper['_id']]
+            if remove:
+                duplicate_sets += 1
+                duplicate_ids.update(remove)
+    return list(duplicate_ids), duplicate_sets
+
+
+@Client.on_message(filters.command("deleteduplicates") & filters.user(ADMINS))
+async def delete_duplicate_files(bot: Client, message: Message):
+    if message.chat.type != enums.ChatType.PRIVATE:
+        return await message.reply_text("<b>This command only works in my PM.</b>", parse_mode=enums.ParseMode.HTML)
+
+    status = await message.reply_text("🔍 Scanning DB for duplicate files...", quote=True)
+    candidates, id_dupes = await _load_duplicate_candidates()
+    duplicate_ids, duplicate_sets = _find_duplicate_ids(candidates, id_dupes)
+
+    if not duplicate_ids:
+        return await status.edit_text(f"✅ Scan complete. Checked <code>{len(candidates)}</code> files. No duplicates found.")
+
+    DUP_SCAN_CACHE[message.from_user.id] = duplicate_ids
+    await status.edit_text(
+        "⚠️ Duplicate scan complete.\n\n"
+        f"Checked files: <code>{len(candidates)}</code>\n"
+        f"Duplicate groups: <code>{duplicate_sets}</code>\n"
+        f"Duplicate files to delete: <code>{len(duplicate_ids)}</code>\n\n"
+        "Language-aware matching is enabled, so Malayalam/Tamil/etc. versions are kept separately.\n"
+        "Continue deletion?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Delete duplicates", callback_data=f"dupedel:yes:{message.from_user.id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"dupedel:no:{message.from_user.id}")],
+        ]),
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^dupedel:(yes|no):(\d+)$"))
+async def duplicate_delete_callback(bot: Client, query: CallbackQuery):
+    action, owner = query.matches[0].group(1), int(query.matches[0].group(2))
+    if query.from_user.id != owner:
+        return await query.answer("This duplicate cleanup is not for you.", show_alert=True)
+    ids = DUP_SCAN_CACHE.pop(owner, [])
+    if action == "no":
+        await query.answer("Cancelled")
+        return await query.message.edit_text("❌ Duplicate deletion cancelled.")
+    if not ids:
+        return await query.message.edit_text("No cached duplicate scan found. Run /deleteduplicates again.")
+
+    await query.answer("Deleting duplicates...")
+    deleted = 0
+    total = len(ids)
+    for start in range(0, total, DUP_BATCH_DELETE):
+        batch = ids[start:start + DUP_BATCH_DELETE]
+        result = await Media.collection.delete_many({'_id': {'$in': batch}})
+        deleted += result.deleted_count
+        await query.message.edit_text(
+            f"🗑️ Deleted <code>{deleted}</code>/<code>{total}</code> duplicate files...",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        await asyncio.sleep(0.2)
+    await query.message.edit_text(
+        f"✅ Duplicate cleanup finished. Deleted <code>{deleted}</code> files.",
+        parse_mode=enums.ParseMode.HTML,
+    )

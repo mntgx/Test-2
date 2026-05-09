@@ -56,6 +56,7 @@ BOT_COMMANDS = [
     BotCommand("bug", "Send bug report / feedback"),
     BotCommand("search", "Search from external sources"),
     BotCommand("deletefiles", "Bulk delete indexed files"),
+    BotCommand("deleteduplicates", "Delete duplicate indexed files"),
     BotCommand("stats", "Show database statistics"),
     BotCommand("ping", "Check bot ping")
 ]
