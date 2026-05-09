@@ -40,7 +40,7 @@ MEDIA_TYPES = (
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
-def _status_text(current, total_files, duplicate, deleted, no_media, unsupported, errors):
+def _status_text(current, total_files, duplicate, deleted, no_media, unsupported, errors, skipped_policy=0):
     return (
         f"Total messages fetched: <code>{current}</code>\n"
         f"Total messages saved: <code>{total_files}</code>\n"
@@ -48,6 +48,7 @@ def _status_text(current, total_files, duplicate, deleted, no_media, unsupported
         f"Deleted Messages Skipped: <code>{deleted}</code>\n"
         f"Non-Media messages skipped: <code>{no_media + unsupported}</code> "
         f"(Unsupported Media – <code>{unsupported}</code>)\n"
+        f"Index Policy Skipped: <code>{skipped_policy}</code>\n"
         f"Errors Occurred: <code>{errors}</code>"
     )
 
@@ -192,7 +193,7 @@ async def _save_concurrently(eligible):
 
     results = await asyncio.gather(*[_one(m) for m in eligible],
                                    return_exceptions=True)
-    total_files = duplicate = errors = 0
+    total_files = duplicate = errors = skipped_policy = 0
     for res in results:
         if isinstance(res, Exception):
             errors += 1
@@ -204,7 +205,9 @@ async def _save_concurrently(eligible):
                 duplicate += 1
             elif code == 2:
                 errors += 1
-    return total_files, duplicate, errors
+            elif code == 3:
+                skipped_policy += 1
+    return total_files, duplicate, errors, skipped_policy
 
 
 # ─── main indexing loop ───────────────────────────────────────────────────────
@@ -218,7 +221,7 @@ async def index_files_to_db(lst_msg_id: int, chat, msg, bot):
     Works with both MongoDB (motor) and PostgreSQL (asyncpg/SQLAlchemy) via
     the save_file abstraction in database/ia_filterdb.
     """
-    total_files = duplicate = errors = deleted = no_media = unsupported = 0
+    total_files = duplicate = errors = deleted = no_media = unsupported = skipped_policy = 0
 
     async with lock:
         try:
@@ -268,7 +271,7 @@ async def index_files_to_db(lst_msg_id: int, chat, msg, bot):
                         msg,
                         "✅ <b>Indexing Cancelled!</b>\n\n" +
                         _status_text(current, total_files, duplicate,
-                                     deleted, no_media, unsupported, errors)
+                                     deleted, no_media, unsupported, errors, skipped_policy)
                     )
                     return
 
@@ -298,10 +301,11 @@ async def index_files_to_db(lst_msg_id: int, chat, msg, bot):
 
                 # save
                 if eligible:
-                    tf, dup, err = await _save_concurrently(eligible)
-                    total_files += tf
-                    duplicate   += dup
-                    errors      += err
+                    tf, dup, err, skipped = await _save_concurrently(eligible)
+                    total_files    += tf
+                    duplicate      += dup
+                    errors         += err
+                    skipped_policy += skipped
 
                 # progress (timer-gated)
                 now = time.monotonic()
@@ -312,7 +316,7 @@ async def index_files_to_db(lst_msg_id: int, chat, msg, bot):
                         f"⚡ <b>Indexing… {pct}%</b>  "
                         f"(<code>{current}</code>/<code>{total_ids}</code>)\n\n" +
                         _status_text(current, total_files, duplicate,
-                                     deleted, no_media, unsupported, errors),
+                                     deleted, no_media, unsupported, errors, skipped_policy),
                         reply_markup=CANCEL_MARKUP
                     )
                     last_edit = now
@@ -329,7 +333,7 @@ async def index_files_to_db(lst_msg_id: int, chat, msg, bot):
         msg,
         "✅ <b>Indexing Complete!</b>\n\n" +
         _status_text(current, total_files, duplicate,
-                     deleted, no_media, unsupported, errors)
+                     deleted, no_media, unsupported, errors, skipped_policy)
     )
 
 
