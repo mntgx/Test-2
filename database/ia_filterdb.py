@@ -25,8 +25,8 @@ from info import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-SEARCH_CACHE_TTL = 30
-SEARCH_CACHE_MAX = 256
+SEARCH_CACHE_TTL = 300
+SEARCH_CACHE_MAX = 2048
 _SEARCH_CACHE = OrderedDict()
 
 BAD_RELEASE_TAGS = (
@@ -231,6 +231,33 @@ def _disk_search_sync(query, file_type=None, max_results=10, offset=0, fast=Fals
     elif next_offset >= total_results:
         next_offset = ''
     return files, next_offset, total_results
+
+
+def _finish_cache_page(matched, max_results, offset, fast):
+    page = matched[offset: offset + max_results + (1 if fast else 0)]
+    has_more = fast and len(page) > max_results
+    files = [_as_media_doc(d) for d in page[:max_results]]
+    next_offset = offset + max_results
+    if fast:
+        total_results = offset + len(files) + (1 if has_more else 0)
+        if not has_more:
+            next_offset = ''
+    else:
+        total_results = len(matched)
+        if next_offset >= total_results:
+            next_offset = ''
+    return files, next_offset, total_results
+
+
+def _search_media_cache(search_filter, max_results, offset, fast):
+    matched = [d for d in _MEDIA_CACHE.values() if _match_filter(d, search_filter)]
+    matched.sort(key=lambda d: d.get('created_at', 0), reverse=True)
+    return _finish_cache_page(matched, max_results, offset, fast)
+
+
+def _can_answer_from_partial_media_cache(result, max_results, offset, fast):
+    files, next_offset, _ = result
+    return fast and offset == 0 and len(files) >= max_results and bool(next_offset)
 
 def _cache_get(key):
     cached = _SEARCH_CACHE.get(key)
@@ -638,9 +665,12 @@ async def preload_media_cache(force=False):
             }
             total = 0
             batch = []
+            recent_docs = []
             for col in _mongo_collections:
-                cursor = col.find({}, projection).batch_size(500)
+                cursor = col.find({}, projection).sort('created_at', -1).batch_size(500)
                 async for doc in cursor:
+                    if cache_limit > 0 and len(recent_docs) < cache_limit:
+                        recent_docs.append(_as_media_doc(doc))
                     batch.append(doc)
                     if len(batch) >= 1000:
                         total += await asyncio.to_thread(_disk_upsert_many_sync, batch)
@@ -648,6 +678,12 @@ async def preload_media_cache(force=False):
                 if batch:
                     total += await asyncio.to_thread(_disk_upsert_many_sync, batch)
                     batch = []
+            for doc in sorted(recent_docs, key=lambda d: d.get('created_at', 0)):
+                fid = doc.get('_id') or doc.get('file_id')
+                if fid:
+                    _MEDIA_CACHE[fid] = doc
+                    while len(_MEDIA_CACHE) > cache_limit:
+                        _MEDIA_CACHE.popitem(last=False)
             _DISK_CACHE_READY = True
             _DISK_CACHE_COMPLETE = True
             _MEDIA_CACHE_READY = True
@@ -963,27 +999,14 @@ async def get_search_results(
         'created_at': 1,
     }
 
+    if _MEDIA_CACHE_READY and _MEDIA_CACHE:
+        result = _search_media_cache(search_filter, max_results, offset, fast)
+        if _MEDIA_CACHE_COMPLETE or _can_answer_from_partial_media_cache(result, max_results, offset, fast):
+            _cache_set(cache_key, result)
+            return _finish_search(*result, started_at, return_time)
+
     if _DISK_CACHE_COMPLETE:
         result = await asyncio.to_thread(_disk_search_sync, query, file_type, max_results, offset, fast)
-        _cache_set(cache_key, result)
-        return _finish_search(*result, started_at, return_time)
-
-    if _MEDIA_CACHE_COMPLETE:
-        matched = [d for d in _MEDIA_CACHE.values() if _match_filter(d, search_filter)]
-        matched.sort(key=lambda d: d.get('created_at', 0), reverse=True)
-        page = matched[offset: offset + max_results + (1 if fast else 0)]
-        has_more = fast and len(page) > max_results
-        files = [_as_media_doc(d) for d in page[:max_results]]
-        next_offset = offset + max_results
-        if fast:
-            total_results = offset + len(files) + (1 if has_more else 0)
-            if not has_more:
-                next_offset = ''
-        else:
-            total_results = len(matched)
-            if next_offset >= total_results:
-                next_offset = ''
-        result = (files, next_offset, total_results)
         _cache_set(cache_key, result)
         return _finish_search(*result, started_at, return_time)
 
