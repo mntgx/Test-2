@@ -84,7 +84,7 @@ FILE_AUTO_DELETE_SECONDS = int(environ.get('FILE_AUTO_DELETE_SECONDS', 60))  # D
 
 # Indexing / request routing
 INDEX_MODE = environ.get('INDEX_MODE', 'both').strip().lower()
-MEDIA_CACHE_MAX = int(environ.get('MEDIA_CACHE_MAX', 5000))
+MEDIA_CACHE_MAX = int(environ.get('MEDIA_CACHE_MAX', 0))
 DISK_MEDIA_CACHE = is_enabled(environ.get('DISK_MEDIA_CACHE', 'False'), False)
 DISK_MEDIA_CACHE_PATH = environ.get('DISK_MEDIA_CACHE_PATH', '/tmp/media_cache.sqlite3')
 MOVIES_REQUEST_GROUP = environ.get('MOVIES_REQUEST_GROUP', '@malayalam_2022')

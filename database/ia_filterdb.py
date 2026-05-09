@@ -254,11 +254,6 @@ def _search_media_cache(search_filter, max_results, offset, fast):
     matched.sort(key=lambda d: d.get('created_at', 0), reverse=True)
     return _finish_cache_page(matched, max_results, offset, fast)
 
-
-def _can_answer_from_partial_media_cache(result, max_results, offset, fast):
-    files, next_offset, _ = result
-    return fast and offset == 0 and len(files) >= max_results and bool(next_offset)
-
 def _cache_get(key):
     cached = _SEARCH_CACHE.get(key)
     if not cached:
@@ -999,11 +994,10 @@ async def get_search_results(
         'created_at': 1,
     }
 
-    if _MEDIA_CACHE_READY and _MEDIA_CACHE:
+    if _MEDIA_CACHE_COMPLETE and _MEDIA_CACHE:
         result = _search_media_cache(search_filter, max_results, offset, fast)
-        if _MEDIA_CACHE_COMPLETE or _can_answer_from_partial_media_cache(result, max_results, offset, fast):
-            _cache_set(cache_key, result)
-            return _finish_search(*result, started_at, return_time)
+        _cache_set(cache_key, result)
+        return _finish_search(*result, started_at, return_time)
 
     if _DISK_CACHE_COMPLETE:
         result = await asyncio.to_thread(_disk_search_sync, query, file_type, max_results, offset, fast)
